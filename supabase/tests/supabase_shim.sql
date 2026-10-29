@@ -17,9 +17,14 @@ create function auth.uid() returns uuid language sql stable as $$
   select nullif(coalesce(current_setting('request.jwt.claim.sub', true),
     (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')), '')::uuid
 $$;
+-- Definición vigente en Supabase Auth (github.com/supabase/auth,
+-- migrations/20220224000811_update_auth_functions.up.sql), copiada tal cual.
 create function auth.role() returns text language sql stable as $$
-  select coalesce(current_setting('request.jwt.claim.role', true),
-    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'))
+  select
+  coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role')
+  )::text
 $$;
 grant usage on schema auth to anon, authenticated, service_role;
 grant execute on all functions in schema auth to anon, authenticated, service_role;

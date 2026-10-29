@@ -5,6 +5,8 @@ import type { Order, PaymentStatus, StaffSession } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 const KEY = 'turestaurante:demo-db:v1';
+/** Plazo para pasar de pago online a caja (igual que en la base de datos). */
+const SWITCH_TO_COUNTER_WINDOW_MS = 2 * 60 * 60 * 1000;
 const CHANNEL = 'turestaurante:demo';
 
 /** Tokens de seguimiento de los clientes (token → id de pedido). Los datos antiguos no lo tienen. */
@@ -188,8 +190,16 @@ export class MockDataService implements DataService {
   async switchToCounterPayment(orderId: string, accessToken: string) {
     const o = this.orderByToken(orderId, accessToken);
     if (!o) throw new Error('Pedido no encontrado');
+    // Mismas reglas que customer_switch_to_counter en supabase/schema.sql
+    const restaurant = this.db.restaurants.find((r) => r.id === o.restaurantId);
+    if (!restaurant?.active) throw new Error('El restaurante no acepta pedidos en este momento');
+    if (!restaurant.counterPaymentEnabled) throw new Error('El pago en caja no está disponible en este restaurante');
     if (o.paymentMethod !== 'online' || !['pendiente_online', 'fallido'].includes(o.paymentStatus) || o.prepStatus !== 'nuevo')
       throw new Error('Este pedido ya no puede cambiar de método de pago');
+    if (Date.now() - new Date(o.createdAt).getTime() > SWITCH_TO_COUNTER_WINDOW_MS)
+      throw new Error('Este pedido ha caducado. Haz un pedido nuevo.');
+    if (o.paymentStatus === 'pendiente_online' && o.paymentRef)
+      throw new Error('Hay un pago online en curso. Espera a que termine o pide ayuda al personal.');
     o.paymentMethod = 'caja';
     o.paymentStatus = 'pendiente_caja';
     this.touch(o);

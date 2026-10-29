@@ -55,6 +55,12 @@ create function tests.payload(token int, extra jsonb default '{}'::jsonb) return
       jsonb_build_object('productId', tests.agua(), 'quantity', 1))) || extra
 $$;
 
+-- Pedido online en «Otro Sitio» (Plato del día, 9 €): mesa 1, qty unidades.
+create function tests.online(token int, qty int) returns jsonb language sql stable as $$
+  select jsonb_build_object('restaurantId', tests.otro(), 'mode', 'mesa', 'table', 1, 'paymentMethod', 'online',
+    'accessToken', tests.tok(token), 'items', jsonb_build_array(jsonb_build_object('productId', tests.otro_prod(), 'quantity', qty)))
+$$;
+
 -- ===================== Datos de prueba (como postgres) =====================
 -- Segundo restaurante, con pago online ACTIVADO desde el servidor (lo permite el SQL Editor).
 insert into public.restaurants (id, slug, name, active, tables, pickup_enabled, online_payment_enabled, counter_payment_enabled)
@@ -221,15 +227,19 @@ select tests.ok((select payment_status = 'cobrado_caja' from public.orders where
 -- La prueba anterior «throws» con patrón vacío no debe contar como fallo si no hubo error: se retira.
 delete from tests.results where name = 'owner: marcar cobrado funciona (comprobación inversa abajo)';
 
--- Ni siquiera el servidor puede cambiar el total, ni verificar un pago en caja
+-- El servidor solo LEE pedidos: los cambia únicamente con las funciones de pago (M4)
 select tests.claims('service_role', null);
 set role service_role;
-select tests.throws(format('update public.orders set total_cents = 1 where id = %L', tests.id('o1')), 'no se pueden modificar', 'service_role: no puede cambiar el total');
-select tests.throws(format('update public.orders set payment_status = %L where id = %L', 'pagado_verificado', tests.id('o1')), 'no permitido|violates check', 'service_role: no puede verificar un pago en caja');
-select tests.throws(format('update public.order_items set quantity = 9 where order_id = %L', tests.id('o1')), 'no se pueden modificar', 'service_role: no puede cambiar líneas de pedido');
+select tests.throws(format('update public.orders set total_cents = 1 where id = %L', tests.id('o1')), 'permission denied', 'service_role: no puede cambiar el total');
+select tests.throws(format('update public.orders set payment_status = %L where id = %L', 'pagado_verificado', tests.id('o1')), 'permission denied', 'service_role: no puede marcar pagos con UPDATE directo');
+select tests.throws(format('update public.order_items set quantity = 9 where order_id = %L', tests.id('o1')), 'permission denied', 'service_role: no puede cambiar líneas de pedido');
+select tests.throws(format('delete from public.orders where id = %L', tests.id('o1')), 'permission denied', 'service_role: no puede borrar pedidos');
+select tests.ok((select count(*) from public.orders) > 0, 'service_role: puede leer pedidos');
 reset role;
--- Desde el SQL Editor (sin sesión) tampoco se puede marcar un pago como verificado
+-- El SQL Editor (propietario, sin sesión) tiene permisos, pero el trigger sigue protegiendo
 select tests.claims(null, null);
+select tests.throws(format('update public.orders set total_cents = 1 where id = %L', tests.id('o1')), 'no se pueden modificar', 'SQL Editor: no puede cambiar el total');
+select tests.throws(format('update public.order_items set quantity = 9 where order_id = %L', tests.id('o1')), 'no se pueden modificar', 'SQL Editor: no puede cambiar líneas de pedido');
 select tests.throws(format('update public.orders set payment_status = %L where id = %L', 'pagado_verificado', tests.id('on1')), 'no permitido', 'SQL Editor: no puede marcar un pago como verificado');
 select tests.throws(format('update public.orders set payment_ref = %L where id = %L', 'x', tests.id('on1')), 'solo la puede registrar el servidor', 'SQL Editor: no puede inventar una referencia de pago');
 
@@ -329,19 +339,230 @@ select tests.ok((select count(*) from public.orders where id = tests.id('on1')) 
 select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.id('on1'), 'en_preparacion'), 'pendiente de pago online', 'owner: no puede mandar a cocina un pedido online pendiente');
 reset role;
 
--- Webhook simulado (service_role): confirma on1 y rechaza on2
+-- ===================== 7. PAGOS ONLINE: SERVIDOR Y AVISOS TARDÍOS (I1) =====================
+-- Nadie salvo el servidor puede usar las funciones de pago
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.payment_record_result(%L, %L, %L, 900)', 'evt_x', 'cs_x', 'pagado'), 'permission denied', 'anónimo: no puede registrar pagos');
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b1');
+set role authenticated;
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on1'), 'cs_x'), 'permission denied', 'owner: no puede abrir cobros');
+select tests.throws(format('select public.payment_record_result(%L, %L, %L, 900)', 'evt_x', 'cs_x', 'pagado'), 'permission denied', 'owner: no puede registrar pagos');
+reset role;
+-- El SQL Editor es el propietario y puede llamarlas, pero el trigger le impide abrir cobros
+select tests.claims(null, null);
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on1'), 'cs_editor'), 'solo la puede registrar el servidor', 'SQL Editor: no puede abrir cobros');
+select tests.ok((select payment_ref is null and payment_status = 'pendiente_online' from public.orders where id = tests.id('on1')), 'SQL Editor: el intento no deja rastro en el pedido');
+
 select tests.claims('service_role', null);
 set role service_role;
-select tests.ok(tests.affected(format('update public.orders set payment_status = %L, payment_ref = %L where id = %L', 'pagado_verificado', 'pi_test_1', tests.id('on1'))) = 1,
-  'servidor (webhook): puede marcar un pago online como verificado');
-select tests.ok(tests.affected(format('update public.orders set payment_status = %L where id = %L', 'fallido', tests.id('on2'))) = 1, 'servidor (webhook): puede marcar un pago como fallido');
-select tests.throws(format('update public.orders set payment_status = %L where id = %L', 'pendiente_online', tests.id('on1')), 'no permitido', 'servidor: no puede deshacer un pago verificado');
+-- Abrir cobro: importe del pedido, restaurante con pago online y pedido online pendiente
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 1)', tests.id('on1'), 'cs_1'), 'no coincide con el total', 'abrir cobro: rechaza importe distinto del pedido');
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on3'), 'cs_caja'), 'no admite un pago online', 'abrir cobro: rechaza pedidos de pago en caja');
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 2320)', tests.id('o1'), 'cs_piazza'), 'pago online no está disponible', 'abrir cobro: rechaza restaurantes sin pago online (La Piazza)');
+select tests.ok((public.payment_checkout_started(tests.id('on1'), 'cs_1', 900) ->> 'amountCents') = '900', 'abrir cobro: devuelve el importe del pedido');
+select tests.ok((public.payment_checkout_started(tests.id('on1'), 'cs_1', 900) ->> 'amountCents') = '900', 'abrir cobro: repetir con la misma referencia no cambia nada');
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on1'), 'cs_1_bis'), 'Ya hay un pago en curso', 'abrir cobro: no abre un segundo cobro a la vez');
 reset role;
+
+-- Con un cobro en curso, el cliente no puede pasar a caja (evita el doble cobro)
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.customer_switch_to_counter(%L, %L)', tests.id('on1'), tests.tok(100)), 'pago online en curso', 'pasar a caja: bloqueado mientras hay un cobro en curso');
+reset role;
+-- Con un cobro real abierto, el SQL Editor tampoco puede darlo por pagado
+select tests.claims(null, null);
+select tests.throws(format('select public.payment_record_result(%L, %L, %L, 900)', 'evt_editor', 'cs_1', 'pagado'), 'no permitido', 'SQL Editor: no puede simular un cobro');
+select tests.ok((select payment_status = 'pendiente_online' from public.orders where id = tests.id('on1')), 'SQL Editor: el pedido sigue sin pagar');
+select tests.ok(not exists (select 1 from public.payment_events where provider_event_id = 'evt_editor'), 'SQL Editor: no queda ningún aviso registrado');
+
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(public.payment_record_result('evt_1', 'cs_1', 'pagado', 900) = 'aplicado', 'aviso de pago correcto: aplicado');
+select tests.ok(public.payment_record_result('evt_1', 'cs_1', 'pagado', 900) = 'aplicado', 'aviso repetido: misma respuesta');
+select tests.ok((select count(*) from public.payment_events where provider_event_id = 'evt_1') = 1, 'aviso repetido: se registra una sola vez');
+select tests.ok(public.payment_record_result('evt_1_fallo', 'cs_1', 'fallido', null) = 'ignorado', 'un fallo tardío no deshace un pago verificado');
+select tests.throws(format('select public.payment_record_result(%L, %L, %L, 900)', 'evt_mal', 'cs_1', 'reembolsado'), 'Resultado de pago no válido', 'aviso con resultado desconocido: rechazado');
+
+-- on2: falla, el cliente reintenta y llega tarde el cobro del primer intento
+select public.payment_checkout_started(tests.id('on2'), 'cs_2', 1800);
+select tests.ok(public.payment_record_result('evt_2', 'cs_2', 'fallido', null) = 'aplicado', 'aviso de pago fallido: aplicado');
+select tests.ok((public.payment_checkout_started(tests.id('on2'), 'cs_2b', 1800) ->> 'orderId')::uuid = tests.id('on2'), 'tras un fallo se puede abrir un nuevo cobro');
+select tests.ok(public.payment_record_result('evt_2_tarde', 'cs_2', 'pagado', 1800) = 'requiere_revision', 'cobro tardío de un intento anterior: requiere revisión');
+
+-- Importe cobrado distinto del pedido
+reset role;
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'on4', public.create_order(tests.online(104, 1));
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select public.payment_checkout_started(tests.id('on4'), 'cs_4', 900);
+select tests.ok(public.payment_record_result('evt_4', 'cs_4', 'pagado', 1) = 'requiere_revision', 'importe cobrado distinto: requiere revisión');
+select tests.ok(public.payment_record_result('evt_desconocido', 'cs_no_existe', 'pagado', 900) = 'requiere_revision', 'cobro con referencia desconocida: requiere revisión');
+reset role;
+select tests.ok((select payment_status = 'pendiente_online' from public.orders where id = tests.id('on4')), 'importe distinto: el pedido NO se da por pagado');
+select tests.ok((select payment_status = 'pendiente_online' from public.orders where id = tests.id('on2')), 'cobro tardío de otro intento: el pedido NO se da por pagado');
+
+-- on6: falla, el cliente pasa a caja y después llega un cobro tardío
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'on6', public.create_order(tests.online(106, 1));
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select public.payment_checkout_started(tests.id('on6'), 'cs_6', 900);
+select public.payment_record_result('evt_6_fallo', 'cs_6', 'fallido', null);
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.ok(public.customer_switch_to_counter(tests.id('on6'), tests.tok(106)) ->> 'paymentStatus' = 'pendiente_caja', 'tras un fallo, el cliente puede pasar a caja');
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(public.payment_record_result('evt_6_tarde', 'cs_6', 'pagado', 900) = 'requiere_revision', 'cobro tardío de un pedido que pasó a caja: requiere revisión');
+reset role;
+select tests.ok((select payment_method = 'caja' and payment_status = 'pendiente_caja' from public.orders where id = tests.id('on6')), 'pedido que pasó a caja: no cambia con el cobro tardío');
+
+-- on7: el personal cancela mientras se paga; el cobro llega después
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'on7', public.create_order(tests.online(107, 1));
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select public.payment_checkout_started(tests.id('on7'), 'cs_7', 900);
+reset role;
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b1');
+set role authenticated;
+select public.staff_set_prep_status(tests.id('on7'), 'cancelado');
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(public.payment_record_result('evt_7', 'cs_7', 'pagado', 900) = 'requiere_revision', 'pedido cancelado y cobrado: requiere revisión (devolución)');
+select tests.throws($$insert into public.payment_events (provider_event_id, payment_ref, outcome, resolution) values ('x', 'x', 'pagado', 'aplicado')$$, 'permission denied', 'service_role: no puede inventar avisos de pago');
+reset role;
+
+-- Restaurante sin pago online: no se abren cobros
+update public.restaurants set online_payment_enabled = false where id = tests.otro();
+select tests.claims('service_role', null);
+set role service_role;
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on4'), 'cs_4b'), 'Ya hay un pago en curso|pago online no está disponible', 'abrir cobro: rechazado si el restaurante no tiene pago online');
+reset role;
+select tests.claims(null, null);
+update public.restaurants set online_payment_enabled = true where id = tests.otro();
+
+-- Quién ve los avisos de pago
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b1');
+set role authenticated;
+select tests.ok((select count(*) from public.payment_events where restaurant_id = tests.otro()) >= 6, 'owner: ve los avisos de pago de su restaurante');
+select tests.ok((select count(*) from public.payment_events where resolution = 'requiere_revision') = 4, 'owner: ve los 4 avisos pendientes de revisión de su restaurante');
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b4');
+select tests.ok((select count(*) from public.payment_events) = 0, 'cocina: no ve avisos de pago');
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000a1');
+select tests.ok((select count(*) from public.payment_events) = 0, 'otro restaurante: no ve avisos de pago ajenos');
+select tests.claims('anon', null);
+set role anon;
+select tests.throws('select * from public.payment_events', 'permission denied', 'anónimo: no puede leer avisos de pago');
+reset role;
+
+-- Cocina: ve el pedido pagado, no el pendiente
 select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b4');
 set role authenticated;
 select tests.ok((select count(*) from public.orders where id = tests.id('on1')) = 1, 'cocina: ve el pedido cuando el pago está verificado');
-select tests.ok((select count(*) from public.orders where id = tests.id('on2')) = 0, 'cocina: no ve el pedido con pago fallido');
+select tests.ok((select count(*) from public.orders where id in (tests.id('on2'), tests.id('on4'))) = 0, 'cocina: no ve pedidos con el pago pendiente');
 reset role;
+
+-- ===================== 8. PASAR A CAJA: RESTAURANTE ACTIVO Y CADUCIDAD (M1) =====================
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'on8', public.create_order(tests.online(108, 1));
+reset role;
+update public.restaurants set active = false where id = tests.otro();
+set role anon;
+select tests.throws(format('select public.customer_switch_to_counter(%L, %L)', tests.id('on8'), tests.tok(108)), 'no acepta pedidos', 'pasar a caja: rechazado si el restaurante está inactivo');
+reset role;
+update public.restaurants set active = true where id = tests.otro();
+-- Pedido online de hace 3 horas (insertado directamente: el trigger impide cambiar created_at)
+insert into public.orders (id, restaurant_id, number, mode, table_number, total_cents, payment_method, payment_status, created_at)
+values ('c0000000-0000-4000-8000-000000000001', tests.otro(), 9999, 'mesa', 1, 900, 'online', 'pendiente_online', now() - interval '3 hours');
+insert into private.order_access (order_id, token_hash) values ('c0000000-0000-4000-8000-000000000001', private.token_hash(tests.tok(109)));
+set role anon;
+select tests.throws(format('select public.customer_switch_to_counter(%L, %L)', 'c0000000-0000-4000-8000-000000000001', tests.tok(109)), 'caducado', 'pasar a caja: rechazado si el pedido tiene más de 2 horas');
+select tests.ok(public.customer_switch_to_counter(tests.id('on8'), tests.tok(108)) ->> 'paymentStatus' = 'pendiente_caja', 'pasar a caja: permitido en un pedido reciente sin cobro en curso');
+reset role;
+
+-- ===================== 9. HISTORIAL Y RETIRADA DE PRODUCTOS (I2) =====================
+select tests.claims(null, null);
+select tests.throws(format('delete from public.restaurants where id = %L', tests.piazza()), 'orders_restaurant_id_fkey', 'no se puede borrar un restaurante con pedidos');
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.piazza()) >= 3, 'el intento de borrado no elimina pedidos');
+-- Un restaurante sin pedidos sí se puede borrar
+insert into public.restaurants (id, slug, name) values ('d0000000-0000-4000-8000-000000000001', 'vacio', 'Vacío');
+insert into public.categories (id, restaurant_id, name) values ('d0000000-0000-4000-8000-000000000101', 'd0000000-0000-4000-8000-000000000001', 'Cat');
+insert into public.products (restaurant_id, category_id, name, price_cents) values ('d0000000-0000-4000-8000-000000000001', 'd0000000-0000-4000-8000-000000000101', 'Prod', 100);
+select tests.ok(tests.affected($$delete from public.restaurants where id = 'd0000000-0000-4000-8000-000000000001'$$) = 1, 'un restaurante sin pedidos sí se puede borrar');
+
+-- El manager retira del catálogo un producto ya pedido (Agua, pedida en o1)
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000a4');
+set role authenticated;
+select tests.ok(tests.affected(format('delete from public.products where id = %L', tests.agua())) = 0, 'cocina: no puede retirar productos');
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000a2');
+select tests.ok(tests.affected(format('delete from public.products where id = %L', tests.agua())) = 1, 'manager: puede retirar un producto ya pedido');
+reset role;
+select tests.ok((select name = 'Agua mineral 50 cl' and unit_price_cents = 220 and quantity = 1 and product_id is null
+  from public.order_items where order_id = tests.id('o1') and name like 'Agua%'), 'la línea conserva nombre, precio y cantidad históricos');
+select tests.claims(null, null);
+select tests.throws(format('update public.order_items set name = %L, product_id = null where order_id = %L and product_id is not null', 'Otro', tests.id('o1')), 'no se pueden modificar', 'la excepción no permite cambiar otros datos de la línea');
+select tests.throws(format('update public.order_items set product_id = %L where order_id = %L and product_id is null', tests.marg(), tests.id('o1')), 'no se pueden modificar', 'no se puede volver a enlazar una línea a otro producto');
+-- Borrar una categoría con productos pedidos (Pizzas, con Margherita) tampoco borra historial
+select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000a1');
+set role authenticated;
+select tests.ok(tests.affected($$delete from public.categories where id = '5e5e0000-0000-4000-8000-000000000102'$$) = 1, 'owner: puede borrar una categoría con productos pedidos');
+reset role;
+select tests.ok((select count(*) from public.order_items where order_id = tests.id('o1') and name = 'Margherita' and unit_price_cents = 1050) = 1, 'las líneas de la categoría borrada se conservan');
+
+-- ===================== 10. ROL DE LA PETICIÓN (M2) =====================
+-- private.request_role() debe devolver exactamente lo mismo que auth.role() de Supabase
+create function tests.same_role(claims text, legacy text) returns boolean language plpgsql as $$
+declare a text; b text;
+begin
+  perform set_config('request.jwt.claims', coalesce(claims, ''), true);
+  perform set_config('request.jwt.claim.role', coalesce(legacy, ''), true);
+  a := auth.role(); b := private.request_role();
+  return a is not distinct from b;
+end $$;
+select tests.ok(tests.same_role('{"role":"anon"}', null), 'rol de la petición = auth.role(): anon');
+select tests.ok(tests.same_role('{"role":"authenticated","sub":"a0000000-0000-4000-8000-0000000000a1"}', null), 'rol de la petición = auth.role(): authenticated');
+select tests.ok(tests.same_role('{"role":"service_role"}', null), 'rol de la petición = auth.role(): service_role');
+select tests.ok(tests.same_role(null, null), 'rol de la petición = auth.role(): SQL Editor (sin JWT)');
+select tests.ok(tests.same_role('{}', null), 'rol de la petición = auth.role(): JWT sin rol');
+select tests.ok(tests.same_role(null, 'authenticated'), 'rol de la petición = auth.role(): formato antiguo de PostgREST');
+select tests.ok(tests.same_role('{"role":"anon"}', 'service_role'), 'rol de la petición = auth.role(): ambos formatos a la vez');
+select tests.claims(null, null);
+select tests.ok(private.request_role() is null, 'SQL Editor: sin rol de petición');
+select tests.ok(tests.affected(format('update public.restaurants set online_payment_enabled = true where id = %L', tests.otro())) = 1,
+  'SQL Editor: puede activar el pago online (cuando exista la integración)');
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 20 where id = %L', tests.otro())) = 1, 'service_role: el trigger le deja administrar restaurantes');
+reset role;
+
+-- ===================== 11. RE-EJECUCIÓN, PERMISOS DEL SERVIDOR Y CONFIGURACIÓN INICIAL (M3, M4) =====================
+select tests.claims(null, null);
+select tests.ok(exists (select 1 from pg_policies where tablename = 'products' and policyname = 'politica_ajena_prueba'),
+  'reejecutar el esquema conserva las políticas ajenas al proyecto');
+select tests.ok((select count(*) from pg_policies where schemaname = 'public' and policyname <> 'politica_ajena_prueba') = 15,
+  'reejecutar el esquema deja exactamente las 15 políticas del proyecto');
+select tests.ok(not has_table_privilege('service_role', 'public.tabla_ajena', 'select')
+  and not has_table_privilege('service_role', 'public.tabla_ajena', 'delete'), 'el esquema no da permisos al servidor sobre tablas ajenas');
+select tests.ok(has_table_privilege('service_role', 'public.products', 'update')
+  and not has_table_privilege('service_role', 'public.orders', 'update')
+  and not has_table_privilege('service_role', 'public.order_items', 'insert'), 'servidor: administra la carta pero no escribe pedidos');
+select tests.ok((select column_default from information_schema.columns where table_schema = 'public' and table_name = 'restaurants'
+  and column_name = 'online_payment_enabled') = 'false', 'pago online desactivado por defecto en restaurantes nuevos');
+select tests.ok((select not online_payment_enabled from public.restaurants where id = tests.piazza()), 'La Piazza (seed) tiene el pago online desactivado');
+select tests.ok((select not online_payment_enabled from public.restaurants where slug = 'nuevo-sitio'), 'restaurante creado desde la app: pago online desactivado');
 
 -- ===================== Resultado =====================
 \o

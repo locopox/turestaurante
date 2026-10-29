@@ -12,7 +12,11 @@ esac
 psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists $DB" -c "create database $DB"
 P="psql -v ON_ERROR_STOP=1 -q -d $DB"
 $P -f tests/supabase_shim.sql
+# Una tabla ajena al proyecto: el esquema no debe darle permisos al servidor
+$P -c "create table public.tabla_ajena (id int); revoke all on public.tabla_ajena from service_role;"
 $P -f schema.sql
+# Una política ajena al proyecto: reejecutar el esquema no debe borrarla
+$P -c "create policy politica_ajena_prueba on public.products for select to authenticated using (false);"
 $P -f schema.sql   # se ejecuta dos veces: debe ser repetible
 $P -f seed.sql
 $P -f seed.sql                 # dos veces: no debe duplicar datos

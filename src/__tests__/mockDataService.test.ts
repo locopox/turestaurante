@@ -50,6 +50,24 @@ describe('MockDataService (modo demo)', () => {
     await expect(svc.switchToCounterPayment(o.id, newAccessToken())).rejects.toThrow('no encontrado');
     expect((await svc.switchToCounterPayment(o.id, input.accessToken)).paymentStatus).toBe('pendiente_caja');
   });
+  it('pasar a caja: rechazado con el restaurante inactivo', async () => {
+    const input = order({ paymentMethod: 'online' });
+    const o = await svc.createOrder(input);
+    const [piazza] = (await svc.listRestaurants()).filter((r) => r.id === 'r-piazza');
+    await svc.saveRestaurant({ ...piazza, active: false });
+    await expect(svc.switchToCounterPayment(o.id, input.accessToken)).rejects.toThrow('no acepta pedidos');
+  });
+  it('pasar a caja: rechazado si el pedido tiene más de 2 horas', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const input = order({ paymentMethod: 'online' });
+      const o = await svc.createOrder(input);
+      vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000 + 1000);
+      await expect(svc.switchToCounterPayment(o.id, input.accessToken)).rejects.toThrow('caducado');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('no se cobra dos veces en caja', async () => {
     const o = await svc.createOrder(order());
     await svc.markPaidAtCounter(o.id);

@@ -11,9 +11,11 @@
 --    (crear pedido, leer SU pedido con su token, pasar a pagar en caja).
 --  * El personal no actualiza pedidos directamente: usa funciones que comprueban su rol.
 --  * Precios y totales se calculan aquí, nunca se aceptan del navegador.
---  * Un pago solo puede quedar «pagado_verificado» desde el servidor (service_role),
---    es decir, desde el futuro webhook del proveedor de pagos.
+--  * Un pago solo puede quedar «pagado_verificado» desde el servidor (service_role), y
+--    solo mediante payment_record_result (futuro webhook del proveedor de pagos).
 --  * El pago online está desactivado por defecto y el personal no puede activarlo.
+--  * El historial no se pierde: un restaurante con pedidos no se puede borrar y las líneas
+--    de pedido conservan nombre y precio aunque el producto se retire del catálogo.
 -- =====================================================================================
 
 begin;
@@ -104,7 +106,8 @@ create index if not exists products_category_idx on public.products (category_id
 
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
-  restaurant_id uuid not null references public.restaurants on delete cascade,
+  -- restrict: un restaurante con pedidos no se puede borrar (se desactiva). Protege el historial.
+  restaurant_id uuid not null references public.restaurants on delete restrict,
   number int not null,
   mode public.order_mode not null,
   table_number int check (table_number between 1 and 500),
@@ -133,6 +136,7 @@ create index if not exists orders_restaurant_prep_idx on public.orders (restaura
 create table if not exists public.order_items (
   id uuid primary key default gen_random_uuid(),
   order_id uuid not null references public.orders on delete cascade,
+  -- Si el producto se borra del catálogo, la línea queda sin enlace pero conserva nombre y precio.
   product_id uuid references public.products on delete set null,
   name text not null,
   unit_price_cents int not null check (unit_price_cents between 0 and 100000),
@@ -149,6 +153,45 @@ create table if not exists private.order_access (
   token_hash bytea not null unique,
   created_at timestamptz not null default now()
 );
+
+-- Si este archivo ya se ejecutó con la versión anterior (pedidos borrados en cascada con el
+-- restaurante), se corrige la clave foránea. No toca datos.
+do $$ begin
+  if exists (select 1 from pg_constraint
+             where conrelid = 'public.orders'::regclass and conname = 'orders_restaurant_id_fkey' and confdeltype <> 'r') then
+    alter table public.orders drop constraint orders_restaurant_id_fkey;
+    alter table public.orders add constraint orders_restaurant_id_fkey
+      foreign key (restaurant_id) references public.restaurants on delete restrict;
+  end if;
+end $$;
+
+-- ---------- Pagos online (preparado; la pasarela real aún NO está integrada) ----------
+-- Cada cobro abierto en la pasarela. Un pedido puede tener varios si el cliente reintenta
+-- tras un fallo; así se reconocen los avisos tardíos de intentos anteriores.
+create table if not exists private.payment_sessions (
+  payment_ref text primary key check (char_length(payment_ref) between 1 and 200),
+  order_id uuid not null references public.orders on delete restrict,
+  created_at timestamptz not null default now()
+);
+create index if not exists payment_sessions_order_idx on private.payment_sessions (order_id);
+
+-- Registro de cada aviso recibido del proveedor. Un aviso que no se puede aplicar con
+-- seguridad (pedido pasado a caja, cancelado, importe distinto…) queda «requiere_revision»
+-- para que una persona lo resuelva (por ejemplo, devolviendo el dinero).
+create table if not exists public.payment_events (
+  id uuid primary key default gen_random_uuid(),
+  provider_event_id text not null unique check (char_length(provider_event_id) between 1 and 200),
+  restaurant_id uuid references public.restaurants on delete restrict,
+  order_id uuid references public.orders on delete restrict,
+  payment_ref text not null check (char_length(payment_ref) between 1 and 200),
+  outcome text not null check (outcome in ('pagado', 'fallido', 'expirado')),
+  amount_cents int check (amount_cents >= 0),
+  resolution text not null check (resolution in ('aplicado', 'ignorado', 'requiere_revision')),
+  detail text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists payment_events_restaurant_idx on public.payment_events (restaurant_id, created_at desc);
+create index if not exists payment_events_order_idx on public.payment_events (order_id);
 
 -- ---------- Funciones auxiliares de permisos (privadas) ----------
 -- Rol del usuario actual en un restaurante. Un administrador de plataforma cuenta como owner.
@@ -178,6 +221,19 @@ language sql stable security definer set search_path = '' as $$
     when 'kitchen' then pstatus not in ('pendiente_online', 'fallido')
     else false
   end
+$$;
+
+-- Rol de la petición actual según el JWT: 'anon', 'authenticated', 'service_role', o null si no
+-- hay JWT (SQL Editor, migraciones). Es una copia EXACTA de la definición vigente de auth.role()
+-- en Supabase Auth (migración 20220224000811_update_auth_functions), función que Supabase marca
+-- como obsoleta. No se usa current_user a propósito: dentro de una función SECURITY DEFINER
+-- current_user es el propietario, no quien hace la petición.
+create or replace function private.request_role() returns text
+language sql stable set search_path = '' as $$
+  select coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role')
+  )::text
 $$;
 
 create or replace function private.token_hash(token text) returns bytea
@@ -212,7 +268,7 @@ begin
   -- hasta que exista una integración real con un proveedor de pagos.
   if new.online_payment_enabled
      and (tg_op = 'INSERT' or not old.online_payment_enabled)
-     and coalesce(auth.role(), '') in ('anon', 'authenticated') then
+     and coalesce(private.request_role(), '') in ('anon', 'authenticated') then
     raise exception 'El pago online no se puede activar desde la aplicación todavía' using errcode = '42501';
   end if;
   return new;
@@ -224,7 +280,7 @@ create trigger restaurants_guard before insert or update on public.restaurants
 create or replace function private.guard_order_update() returns trigger
 language plpgsql set search_path = '' as $$
 declare
-  caller text := coalesce(auth.role(), '');
+  caller text := coalesce(private.request_role(), '');
 begin
   -- Datos que nunca cambian tras crear el pedido (incluido el importe).
   if (new.id, new.restaurant_id, new.number, new.created_at, new.mode, new.table_number, new.customer_name,
@@ -248,7 +304,10 @@ begin
       null; -- el cliente decide pagar en caja
     elsif caller = 'service_role' and old.payment_method = 'online' and new.payment_method = 'online'
        and old.payment_status in ('pendiente_online', 'fallido') and new.payment_status in ('pagado_verificado', 'fallido') then
-      null; -- webhook del proveedor (servidor)
+      null; -- resultado del proveedor (servidor, vía payment_record_result)
+    elsif caller = 'service_role' and old.payment_method = 'online' and new.payment_method = 'online'
+       and old.payment_status = 'fallido' and new.payment_status = 'pendiente_online' then
+      null; -- nuevo intento de pago tras un fallo (servidor, vía payment_checkout_started)
     else
       raise exception 'Cambio de estado de pago no permitido' using errcode = '42501';
     end if;
@@ -272,6 +331,14 @@ create trigger orders_guard before update on public.orders
 create or replace function private.guard_order_items() returns trigger
 language plpgsql set search_path = '' as $$
 begin
+  -- Única excepción: al borrar un producto del catálogo, PostgreSQL pone product_id a null
+  -- («on delete set null»). Se permite solo si el resto de la línea (nombre, precio,
+  -- cantidad…) queda exactamente igual.
+  if old.product_id is not null and new.product_id is null
+     and (new.id, new.order_id, new.name, new.unit_price_cents, new.quantity, new.notes)
+         is not distinct from (old.id, old.order_id, old.name, old.unit_price_cents, old.quantity, old.notes) then
+    return new;
+  end if;
   raise exception 'Las líneas de un pedido no se pueden modificar' using errcode = '42501';
 end $$;
 drop trigger if exists order_items_guard on public.order_items;
@@ -473,9 +540,12 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 -- El cliente abandona el pago online y pagará en caja.
+-- Solo si: el token es suyo, el restaurante está activo y acepta caja, el pedido sigue en
+-- «nuevo», tiene menos de 2 horas y no hay un cobro en curso en la pasarela.
 create or replace function public.customer_switch_to_counter(p_order_id uuid, p_token text) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
+  c_switch_window constant interval := interval '2 hours';
   o public.orders;
   r public.restaurants;
 begin
@@ -487,11 +557,22 @@ begin
     raise exception 'Pedido no encontrado' using errcode = '22023';
   end if;
   select * into r from public.restaurants where id = o.restaurant_id;
+  if not r.active then
+    raise exception 'El restaurante no acepta pedidos en este momento' using errcode = '22023';
+  end if;
   if not r.counter_payment_enabled then
     raise exception 'El pago en caja no está disponible en este restaurante' using errcode = '22023';
   end if;
   if o.payment_method <> 'online' or o.payment_status not in ('pendiente_online', 'fallido') or o.prep_status <> 'nuevo' then
     raise exception 'Este pedido ya no puede cambiar de método de pago' using errcode = '22023';
+  end if;
+  if o.created_at < now() - c_switch_window then
+    raise exception 'Este pedido ha caducado. Haz un pedido nuevo.' using errcode = '22023';
+  end if;
+  -- payment_ref solo lo escribe el servidor al abrir el cobro: si el estado sigue pendiente,
+  -- el cliente puede estar pagando ahora mismo y cambiar a caja provocaría un doble cobro.
+  if o.payment_status = 'pendiente_online' and o.payment_ref is not null then
+    raise exception 'Hay un pago online en curso. Espera a que termine o pide ayuda al personal.' using errcode = '22023';
   end if;
   update public.orders set payment_method = 'caja', payment_status = 'pendiente_caja' where id = o.id;
   return private.customer_order_json(o.id);
@@ -545,6 +626,124 @@ begin
   update public.orders set payment_status = 'cobrado_caja' where id = o.id;
 end $$;
 
+-- ---------- Funciones para el servidor de pagos (solo service_role) ----------
+-- NO las usa la app. Están preparadas para las Edge Functions de la pasarela real:
+--  1. create-checkout: lee el total del pedido (service_role tiene SELECT en orders), abre el
+--     cobro en la pasarela por ESE importe y llama a payment_checkout_started con la referencia.
+--     Si la función falla (p. ej. el cliente pasó a caja mientras tanto), debe anular el cobro
+--     en la pasarela.
+--  2. payment-webhook: verifica la FIRMA del aviso del proveedor y llama a
+--     payment_record_result con el id del aviso, la referencia, el resultado y el importe cobrado.
+-- Ni el SQL Editor ni el personal pueden usarlas: el trigger exige service_role.
+
+-- Registra que se ha abierto un cobro. Devuelve el importe que debe cobrarse.
+create or replace function public.payment_checkout_started(p_order_id uuid, p_payment_ref text, p_amount_cents int)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  o public.orders;
+  r public.restaurants;
+begin
+  if coalesce(p_payment_ref, '') = '' or char_length(p_payment_ref) > 200 then
+    raise exception 'Referencia de pago no válida' using errcode = '22023';
+  end if;
+  select * into o from public.orders where id = p_order_id for update;
+  if not found then
+    raise exception 'Pedido no encontrado' using errcode = '22023';
+  end if;
+  if o.payment_ref = p_payment_ref then
+    return jsonb_build_object('orderId', o.id, 'amountCents', o.total_cents); -- reintento: sin cambios
+  end if;
+  if p_amount_cents is distinct from o.total_cents then
+    raise exception 'El importe del cobro no coincide con el total del pedido' using errcode = '22023';
+  end if;
+  select * into r from public.restaurants where id = o.restaurant_id;
+  if not r.active or not r.online_payment_enabled then
+    raise exception 'El pago online no está disponible en este restaurante' using errcode = '22023';
+  end if;
+  if o.payment_method <> 'online' or o.payment_status not in ('pendiente_online', 'fallido') or o.prep_status <> 'nuevo' then
+    raise exception 'Este pedido no admite un pago online' using errcode = '22023';
+  end if;
+  if o.payment_status = 'pendiente_online' and o.payment_ref is not null then
+    raise exception 'Ya hay un pago en curso para este pedido' using errcode = '22023';
+  end if;
+  insert into private.payment_sessions (payment_ref, order_id) values (p_payment_ref, o.id);
+  update public.orders set payment_ref = p_payment_ref, payment_status = 'pendiente_online' where id = o.id;
+  return jsonb_build_object('orderId', o.id, 'amountCents', o.total_cents);
+end $$;
+
+-- Aplica el resultado de la pasarela. Idempotente por p_provider_event_id.
+-- Devuelve 'aplicado', 'ignorado' o 'requiere_revision'. Nunca da por pagado un pedido si
+-- el importe no coincide o si el pedido ya no esperaba ese cobro.
+create or replace function public.payment_record_result(p_provider_event_id text, p_payment_ref text,
+  p_outcome text, p_amount_cents int)
+returns text language plpgsql security definer set search_path = '' as $$
+declare
+  v_session private.payment_sessions;
+  o public.orders;
+  v_previous text;
+  v_resolution text;
+  v_detail text := '';
+begin
+  if coalesce(p_provider_event_id, '') = '' or char_length(p_provider_event_id) > 200
+     or coalesce(p_payment_ref, '') = '' or char_length(p_payment_ref) > 200 then
+    raise exception 'Aviso de pago no válido' using errcode = '22023';
+  end if;
+  if p_outcome is null or p_outcome not in ('pagado', 'fallido', 'expirado') then
+    raise exception 'Resultado de pago no válido' using errcode = '22023';
+  end if;
+  if p_amount_cents < 0 then
+    raise exception 'Importe no válido' using errcode = '22023';
+  end if;
+
+  -- El proveedor puede reenviar el mismo aviso, incluso a la vez: se procesa una sola vez.
+  perform pg_advisory_xact_lock(hashtextextended('payment_event:' || p_provider_event_id, 0));
+  select e.resolution into v_previous from public.payment_events e where e.provider_event_id = p_provider_event_id;
+  if found then
+    return v_previous;
+  end if;
+
+  select * into v_session from private.payment_sessions where payment_ref = p_payment_ref;
+  if found then
+    select * into o from public.orders where id = v_session.order_id for update;
+  end if;
+
+  if o.id is null then
+    v_resolution := case when p_outcome = 'pagado' then 'requiere_revision' else 'ignorado' end;
+    v_detail := 'Referencia de pago desconocida';
+  elsif o.payment_ref is distinct from p_payment_ref then
+    v_resolution := case when p_outcome = 'pagado' then 'requiere_revision' else 'ignorado' end;
+    v_detail := 'Aviso de un intento de pago anterior';
+  elsif p_outcome = 'pagado' then
+    if p_amount_cents is distinct from o.total_cents then
+      v_resolution := 'requiere_revision';
+      v_detail := format('Importe cobrado (%s) distinto del total del pedido (%s)', p_amount_cents, o.total_cents);
+    elsif o.payment_method = 'online' and o.payment_status in ('pendiente_online', 'fallido') then
+      update public.orders set payment_status = 'pagado_verificado' where id = o.id;
+      if o.prep_status = 'cancelado' then
+        v_resolution := 'requiere_revision';
+        v_detail := 'Pedido cancelado y cobrado: hay que devolver el importe';
+      else
+        v_resolution := 'aplicado';
+      end if;
+    else
+      v_resolution := 'requiere_revision';
+      v_detail := 'Cobro recibido para un pedido que ya no lo esperaba (pasó a caja o ya estaba pagado)';
+    end if;
+  else
+    if o.payment_method = 'online' and o.payment_status = 'pendiente_online' then
+      update public.orders set payment_status = 'fallido' where id = o.id;
+      v_resolution := 'aplicado';
+    else
+      v_resolution := 'ignorado';
+      v_detail := 'El pedido no estaba pendiente de pago online';
+    end if;
+  end if;
+
+  insert into public.payment_events (provider_event_id, restaurant_id, order_id, payment_ref, outcome, amount_cents, resolution, detail)
+  values (p_provider_event_id, o.restaurant_id, o.id, p_payment_ref, p_outcome, p_amount_cents, v_resolution, v_detail);
+  return v_resolution;
+end $$;
+
 -- Restaurantes y rol del usuario actual (para la app del personal).
 create or replace function public.my_memberships() returns table (restaurant_id uuid, role public.staff_role)
 language sql stable security definer set search_path = '' as $$
@@ -559,6 +758,8 @@ $$;
 revoke all on all functions in schema private from public, anon, authenticated;
 grant execute on function private.staff_role_for(uuid), private.has_role(uuid, public.staff_role[]),
   private.is_platform_admin(), private.can_view_order(uuid, public.payment_status) to authenticated;
+-- La usan los triggers, que se ejecutan con el rol de quien modifica la tabla.
+grant execute on function private.request_role() to authenticated, service_role;
 
 revoke all on function public.create_order(jsonb), public.get_customer_order(uuid, text),
   public.customer_switch_to_counter(uuid, text), public.staff_set_prep_status(uuid, public.prep_status),
@@ -567,13 +768,17 @@ grant execute on function public.create_order(jsonb), public.get_customer_order(
   public.customer_switch_to_counter(uuid, text) to anon, authenticated;
 grant execute on function public.staff_set_prep_status(uuid, public.prep_status),
   public.staff_mark_paid_at_counter(uuid), public.my_memberships() to authenticated;
+revoke all on function public.payment_checkout_started(uuid, text, int),
+  public.payment_record_result(text, text, text, int) from public, anon, authenticated;
+grant execute on function public.payment_checkout_started(uuid, text, int),
+  public.payment_record_result(text, text, text, int) to service_role;
 
 -- ---------- Permisos sobre tablas + RLS ----------
 revoke all on all tables in schema private from public, anon, authenticated;
 
 -- Nadie escribe pedidos directamente desde la API: solo mediante las funciones de arriba.
-revoke all on public.orders, public.order_items from anon, authenticated;
-grant select on public.orders, public.order_items to authenticated;
+revoke all on public.orders, public.order_items, public.payment_events from anon, authenticated;
+grant select on public.orders, public.order_items, public.payment_events to authenticated;
 revoke all on public.restaurant_staff, public.platform_admins from anon;
 revoke insert, update, delete, truncate, references, trigger on public.platform_admins from authenticated;
 revoke insert, update, delete, truncate, references, trigger on public.restaurants, public.categories, public.products from anon;
@@ -584,8 +789,14 @@ grant insert, update on public.restaurants to authenticated;
 grant insert, update, delete on public.categories, public.products to authenticated;
 grant select, insert, update, delete on public.restaurant_staff to authenticated;
 grant select on public.platform_admins to authenticated;
--- Servidor (Edge Functions con la clave secreta): acceso completo; los triggers siguen protegiendo importes y pagos.
-grant select, insert, update, delete on all tables in schema public to service_role;
+-- Servidor (Edge Functions con la clave secreta): solo las tablas de TuRestaurante.
+-- Puede administrar restaurantes, carta y personal. Sobre pedidos y pagos solo LEE: los cambia
+-- únicamente a través de payment_checkout_started y payment_record_result.
+revoke all on public.restaurants, public.categories, public.products, public.restaurant_staff,
+  public.platform_admins, public.orders, public.order_items, public.payment_events from service_role;
+grant select, insert, update, delete on public.restaurants, public.categories, public.products,
+  public.restaurant_staff, public.platform_admins to service_role;
+grant select on public.orders, public.order_items, public.payment_events to service_role;
 
 alter table public.restaurants enable row level security;
 alter table public.restaurant_staff enable row level security;
@@ -596,16 +807,37 @@ alter table public.orders enable row level security;
 alter table public.order_items enable row level security;
 alter table private.order_counters enable row level security;
 alter table private.order_access enable row level security;
+alter table private.payment_sessions enable row level security;
+alter table public.payment_events enable row level security;
 
--- Elimina las políticas de la versión 1 y de ejecuciones anteriores de este archivo.
-do $$ declare pol record; begin
-  for pol in select schemaname, tablename, policyname from pg_policies
-             where schemaname = 'public' and tablename in
-               ('restaurants', 'restaurant_staff', 'platform_admins', 'categories', 'products', 'orders', 'order_items')
-  loop
-    execute format('drop policy %I on %I.%I', pol.policyname, pol.schemaname, pol.tablename);
-  end loop;
-end $$;
+-- Elimina SOLO las políticas de este proyecto (para poder recrearlas) y las de la versión 1.
+-- Las políticas que añadas tú con otros nombres se conservan.
+drop policy if exists restaurants_select on public.restaurants;
+drop policy if exists restaurants_insert on public.restaurants;
+drop policy if exists restaurants_update on public.restaurants;
+drop policy if exists staff_select on public.restaurant_staff;
+drop policy if exists staff_insert on public.restaurant_staff;
+drop policy if exists staff_update on public.restaurant_staff;
+drop policy if exists staff_delete on public.restaurant_staff;
+drop policy if exists platform_admins_select on public.platform_admins;
+drop policy if exists categories_select on public.categories;
+drop policy if exists categories_write on public.categories;
+drop policy if exists products_select on public.products;
+drop policy if exists products_write on public.products;
+drop policy if exists orders_select on public.orders;
+drop policy if exists order_items_select on public.order_items;
+drop policy if exists payment_events_select on public.payment_events;
+-- Nombres de la versión 1
+drop policy if exists "carta pública restaurantes" on public.restaurants;
+drop policy if exists "staff edita restaurante" on public.restaurants;
+drop policy if exists "admin crea restaurantes" on public.restaurants;
+drop policy if exists "carta pública categorías" on public.categories;
+drop policy if exists "staff gestiona categorías" on public.categories;
+drop policy if exists "carta pública productos" on public.products;
+drop policy if exists "staff gestiona productos" on public.products;
+drop policy if exists "staff ve pedidos" on public.orders;
+drop policy if exists "staff actualiza pedidos" on public.orders;
+drop policy if exists "staff ve líneas" on public.order_items;
 
 -- Restaurantes: la carta es pública; editar, solo owner/manager; crear, solo administradores.
 create policy restaurants_select on public.restaurants for select to anon, authenticated using (true);
@@ -641,6 +873,10 @@ create policy orders_select on public.orders for select to authenticated
   using (private.can_view_order(restaurant_id, payment_status));
 create policy order_items_select on public.order_items for select to authenticated
   using (exists (select 1 from public.orders o where o.id = order_items.order_id));
+
+-- Avisos de pago: los ven owner y manager de su restaurante (para resolver las revisiones).
+create policy payment_events_select on public.payment_events for select to authenticated
+  using (private.has_role(restaurant_id, array['owner', 'manager']::public.staff_role[]));
 
 -- ---------- Tiempo real (panel y cocina; respeta RLS) ----------
 do $$ begin

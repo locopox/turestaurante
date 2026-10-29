@@ -32,9 +32,12 @@ npm run dev
   Su mejor resultado es «Pago simulado», nunca un pago verificado.
 - Con **Supabase**, el pago online está **desactivado**: solo se ofrece pago en caja. La base de datos lo rechaza
   aunque alguien manipule el navegador, y el personal no puede activarlo desde la app.
-- `pagado_verificado` solo lo puede escribir el servidor con la clave `service_role` (el futuro webhook del
-  proveedor de pagos). Ni el navegador, ni el personal, ni el SQL Editor pueden asignarlo.
+- `pagado_verificado` solo lo puede escribir el servidor con la clave `service_role`, y solo a través de
+  `payment_record_result` (el futuro webhook del proveedor). Ni el navegador, ni el personal, ni el SQL Editor
+  pueden asignarlo.
 - Un pedido con pago online pendiente o fallido no llega a cocina.
+- El cliente puede pasar de pago online a caja solo si el restaurante está activo, el pedido tiene menos de
+  2 horas y **no hay un cobro en curso** en la pasarela (evita el doble cobro).
 
 ## Estructura
 
@@ -69,9 +72,12 @@ supabase/
 | `waiter` | Lo de cocina, y además ver todos los pedidos, cobrar en caja y cancelar. |
 | `manager` / `owner` | Lo anterior, y además editar la carta y la configuración de su restaurante. |
 | Administrador de plataforma | Todo, en todos los restaurantes. Crear restaurantes y asignar personal. |
+| Servidor (`service_role`) | Administrar restaurantes, carta y personal. Sobre pedidos y pagos solo **lee**: los cambia únicamente con `payment_checkout_started` y `payment_record_result`. No tiene permisos sobre tablas ajenas a TuRestaurante. |
 
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
+- **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
+  categoría se pueden borrar: las líneas de pedido conservan nombre, precio y cantidad.
 - **El token del cliente** son 64 caracteres aleatorios generados en su navegador. La base de datos guarda
   solo su hash, en un esquema privado. Reenviar el mismo token devuelve el mismo pedido, así que no se duplica.
 
@@ -111,13 +117,22 @@ npm run test:db   # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase
 
 ## Pagos reales (fase siguiente, no implementada)
 
-1. Edge Function `create-checkout`: lee el importe del pedido en la base de datos y crea la sesión con la clave
-   secreta del proveedor (guardada como secreto de Supabase, nunca en `VITE_*`).
-2. Edge Function `payment-webhook`: verifica la firma del proveedor y, con la `service_role`, pasa el pedido a
-   `pagado_verificado` o `fallido` (el trigger solo permite esas transiciones). Comprobar que el importe cobrado
-   coincide con `total_cents`.
-3. Activar `online_payment_enabled` del restaurante desde el SQL Editor y habilitar la opción en la app.
-   `src/services/payments/stripeProvider.ts` es solo un esqueleto.
+La base de datos ya está preparada; falta la pasarela. **Nada en la app llama todavía a estas funciones.**
+
+1. **Edge Function `create-checkout`** (con la clave secreta, guardada como secreto de Supabase, nunca en `VITE_*`):
+   lee `total_cents` del pedido, abre el cobro en la pasarela por ese importe y llama a
+   `payment_checkout_started(pedido, referencia, importe)`. Si esa llamada falla (por ejemplo, el cliente pasó a
+   caja mientras tanto), debe **anular el cobro en la pasarela**.
+2. **Edge Function `payment-webhook`**: verifica la **firma** del aviso del proveedor y llama a
+   `payment_record_result(id_del_aviso, referencia, 'pagado' | 'fallido' | 'expirado', importe_cobrado)`.
+   - El mismo aviso repetido se procesa una sola vez.
+   - Solo marca `pagado_verificado` si la referencia es la del cobro vigente, el importe coincide con el total y el
+     pedido sigue esperando ese pago.
+   - Cualquier otro caso (pedido pasado a caja, cancelado, intento anterior, importe distinto, referencia
+     desconocida) queda en `payment_events` como **`requiere_revision`**: hay que revisarlo y, si procede,
+     devolver el dinero. Falta una pantalla para que owner y manager vean esas revisiones.
+3. Activar `online_payment_enabled` del restaurante desde el SQL Editor (la app no puede) y habilitar la opción
+   en `src/config.ts` (`onlinePaymentsAvailable`). `src/services/payments/stripeProvider.ts` es solo un esqueleto.
 
 ## Rutas
 
