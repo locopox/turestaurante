@@ -7,7 +7,8 @@ import {
   paymentLabel, prepLabel,
 } from '../../lib/format';
 import { data } from '../../services';
-import type { Order, PrepStatus, Restaurant } from '../../types';
+import { can } from '../../lib/permissions';
+import type { Order, PrepStatus, Restaurant, StaffSession } from '../../types';
 
 type Filter = 'activos' | 'cobro' | 'finalizados' | 'todos';
 const filters: { id: Filter; label: string; test: (o: Order) => boolean }[] = [
@@ -17,7 +18,7 @@ const filters: { id: Filter; label: string; test: (o: Order) => boolean }[] = [
   { id: 'todos', label: 'Todos', test: () => true },
 ];
 
-export function OrdersPanel({ restaurant }: { restaurant: Restaurant }) {
+export function OrdersPanel({ restaurant, session }: { restaurant: Restaurant; session: StaffSession | null }) {
   const { value: orders = [], loading, error } = useOrders(restaurant.id);
   const [filter, setFilter] = useState<Filter>('activos');
   const [q, setQ] = useState('');
@@ -88,7 +89,9 @@ export function OrdersPanel({ restaurant }: { restaurant: Restaurant }) {
             <span>Pedido</span><span>Origen</span><span>Productos</span><span>Importe</span><span>Pago</span><span>Preparación</span><span />
           </div>
           <ul>
-            {visible.map((o) => <OrderRow key={o.id} order={o} now={now} />)}
+            {visible.map((o) => <OrderRow key={o.id} order={o} now={now}
+              canPrep={can(session, restaurant.id, 'orders.prep')} canCancel={can(session, restaurant.id, 'orders.cancel')}
+              canCollect={can(session, restaurant.id, 'orders.collect')} />)}
           </ul>
         </div>
       )}
@@ -108,7 +111,9 @@ function Stat({ label, value, sub, tone }: { label: string; value: string; sub?:
   );
 }
 
-function OrderRow({ order: o, now }: { order: Order; now: number }) {
+function OrderRow({ order: o, now, canPrep, canCancel, canCollect }: {
+  order: Order; now: number; canPrep: boolean; canCancel: boolean; canCollect: boolean;
+}) {
   const toast = useToast();
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -151,17 +156,17 @@ function OrderRow({ order: o, now }: { order: Order; now: number }) {
           </>
         ) : (
           <>
-            {next && o.paymentStatus !== 'pendiente_online' && o.paymentStatus !== 'fallido' && (
+            {canPrep && next && o.paymentStatus !== 'pendiente_online' && o.paymentStatus !== 'fallido' && (
               <button className="btn btn--primary btn--sm" disabled={busy} onClick={() => setPrep(next.to, `${orderCode(o.number)}: ${prepLabel[next.to].label}`)}>
                 {next.action}
               </button>
             )}
-            {needsCounterPayment(o) && (
+            {canCollect && needsCounterPayment(o) && (
               <button className="btn btn--outline btn--sm" disabled={busy} onClick={() => act(() => data.markPaidAtCounter(o.id), `Cobro de ${orderCode(o.number)} registrado`)}>
                 <Icon name="cash" size={16} /> Cobrado en caja
               </button>
             )}
-            {o.prepStatus !== 'cancelado' && o.prepStatus !== 'entregado' && (
+            {canCancel && o.prepStatus !== 'cancelado' && o.prepStatus !== 'entregado' && (
               <button className="btn btn--ghost btn--sm" onClick={() => setConfirmCancel(true)}>Cancelar</button>
             )}
           </>

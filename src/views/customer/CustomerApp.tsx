@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { FoodArt } from '../../components/FoodArt';
 import { useToast } from '../../components/Toast';
 import { Badge, Icon, Modal, Notice, Spinner, Stepper } from '../../components/ui';
-import { useMenu, useOrder } from '../../hooks/useData';
+import { onlinePaymentsAvailable } from '../../config';
+import { useCustomerOrder, useMenu } from '../../hooks/useData';
 import { formatPrice, formatTime, orderCode, originLabel, paymentLabel, prepLabel } from '../../lib/format';
+import { newAccessToken } from '../../lib/orderRules';
 import { safeStorage } from '../../lib/storage';
 import { data, payments } from '../../services';
 import type { Order, OrderMode, PaymentMethod, Product, ProductTag, Restaurant } from '../../types';
@@ -21,7 +23,8 @@ export function CustomerApp({ restaurant, qrTable }: { restaurant: Restaurant; q
   const [step, setStep] = useState<Step>('menu');
   const [cart, setCart] = useState<Cart>(() => safeStorage.get<Cart>(cartKey, {}));
   const [detail, setDetail] = useState<Product | null>(null);
-  const [orderId, setOrderId] = useState<string | null>(null);
+  // Pedido creado y su token secreto: es lo único que permite al cliente consultarlo.
+  const [placed, setPlaced] = useState<{ id: string; token: string } | null>(null);
 
   useEffect(() => { safeStorage.set(cartKey, cart); }, [cart, cartKey]);
   useEffect(() => { window.scrollTo(0, 0); }, [step]);
@@ -55,19 +58,19 @@ export function CustomerApp({ restaurant, qrTable }: { restaurant: Restaurant; q
   if (loading && !menu) return <div className="cx"><CxHeader restaurant={restaurant} qrTable={qrTable} /><Spinner label="Cargando la carta…" /></div>;
   if (error) return <div className="cx"><div className="cx-body"><Notice tone="danger">No se pudo cargar la carta: {error}</Notice></div></div>;
 
-  if (step === 'confirm' && orderId)
-    return <Confirmation restaurant={restaurant} orderId={orderId} onNew={() => { setOrderId(null); setStep('menu'); }} />;
+  if (step === 'confirm' && placed)
+    return <Confirmation restaurant={restaurant} orderId={placed.id} token={placed.token} onNew={() => { setPlaced(null); setStep('menu'); }} />;
 
-  if (step === 'payment' && orderId)
-    return <SimulatedPayment restaurant={restaurant} orderId={orderId} onDone={() => setStep('confirm')} />;
+  if (step === 'payment' && placed)
+    return <SimulatedPayment restaurant={restaurant} orderId={placed.id} token={placed.token} onDone={() => setStep('confirm')} />;
 
   if (step === 'checkout')
     return (
       <Checkout restaurant={restaurant} qrTable={qrTable} lines={lines} total={total}
         onBack={() => setStep('cart')}
-        onPlaced={(order) => {
+        onPlaced={(order, token) => {
           setCart({});
-          setOrderId(order.id);
+          setPlaced({ id: order.id, token });
           setStep(order.paymentMethod === 'online' ? 'payment' : 'confirm');
         }} />
     );
@@ -278,7 +281,7 @@ function pickupSlots(prepMinutes: number): string[] {
 
 function Checkout({ restaurant, qrTable, lines, total, onBack, onPlaced }: {
   restaurant: Restaurant; qrTable?: number; lines: { product: Product; quantity: number; notes?: string }[]; total: number;
-  onBack: () => void; onPlaced: (o: Order) => void;
+  onBack: () => void; onPlaced: (o: Order, token: string) => void;
 }) {
   const toast = useToast();
   const [mode, setMode] = useState<OrderMode>(qrTable || !restaurant.pickupEnabled ? 'mesa' : 'recoger');
@@ -287,7 +290,11 @@ function Checkout({ restaurant, qrTable, lines, total, onBack, onPlaced }: {
   const [phone, setPhone] = useState('');
   const [pickup, setPickup] = useState('asap');
   const [notes, setNotes] = useState('');
-  const [method, setMethod] = useState<PaymentMethod>(restaurant.onlinePaymentEnabled ? 'online' : 'caja');
+  // El pago online solo se ofrece en la demo (pasarela simulada) y si el restaurante lo tiene activado.
+  const onlineOk = onlinePaymentsAvailable && restaurant.onlinePaymentEnabled;
+  const [method, setMethod] = useState<PaymentMethod>(onlineOk ? 'online' : 'caja');
+  // Un token por intento de compra: si se reintenta tras un error de red, no se duplica el pedido.
+  const [accessToken] = useState(newAccessToken);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [sending, setSending] = useState(false);
   const slots = useMemo(() => pickupSlots(restaurant.prepMinutes), [restaurant.prepMinutes]);
@@ -304,10 +311,10 @@ function Checkout({ restaurant, qrTable, lines, total, onBack, onPlaced }: {
       const order = await data.createOrder({
         restaurantId: restaurant.id, mode, table: mode === 'mesa' ? Number(table) : null,
         customerName: mode === 'recoger' ? name : null, customerPhone: mode === 'recoger' ? phone : null,
-        pickupTime: mode === 'recoger' ? pickup : null, notes, paymentMethod: method,
+        pickupTime: mode === 'recoger' ? pickup : null, notes, paymentMethod: method, accessToken,
         items: lines.map((l) => ({ productId: l.product.id, quantity: l.quantity, notes: l.notes })),
       });
-      onPlaced(order);
+      onPlaced(order, accessToken);
     } catch (err) {
       toast((err as Error).message, 'danger');
     } finally {
@@ -366,8 +373,8 @@ function Checkout({ restaurant, qrTable, lines, total, onBack, onPlaced }: {
           <legend>¿Cómo quieres pagar?</legend>
           <div className="choice-grid">
             <Choice name="pay" checked={method === 'online'} onChange={() => setMethod('online')} icon="card" title="Pagar ahora"
-              text={restaurant.onlinePaymentEnabled ? (payments.simulated ? 'Pago online (simulado en esta demo)' : 'Tarjeta o wallet') : 'No disponible'}
-              disabled={!restaurant.onlinePaymentEnabled} />
+              text={onlineOk ? 'Pago online (simulado en esta demo)' : onlinePaymentsAvailable ? 'No disponible' : 'Próximamente'}
+              disabled={!onlineOk} />
             <Choice name="pay" checked={method === 'caja'} onChange={() => setMethod('caja')} icon="cash" title="Pagar en caja"
               text={mode === 'mesa' ? 'Al terminar, en caja o con el camarero' : 'Al recoger tu pedido'} disabled={!restaurant.counterPaymentEnabled} />
           </div>
@@ -406,11 +413,11 @@ function Choice({ name, checked, onChange, icon, title, text, disabled }: {
   );
 }
 
-function SimulatedPayment({ restaurant, orderId, onDone }: { restaurant: Restaurant; orderId: string; onDone: () => void }) {
+function SimulatedPayment({ restaurant, orderId, token, onDone }: { restaurant: Restaurant; orderId: string; token: string; onDone: () => void }) {
   const toast = useToast();
-  const { value: order } = useOrder(orderId, restaurant.id);
+  const { value: order, loading } = useCustomerOrder(orderId, token);
   const [busy, setBusy] = useState(false);
-  if (!order) return <div className="cx"><Spinner /></div>;
+  if (!order) return <div className="cx">{loading ? <Spinner /> : <OrderNotFound />}</div>;
 
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -443,7 +450,7 @@ function SimulatedPayment({ restaurant, orderId, onDone }: { restaurant: Restaur
           </button>
           {restaurant.counterPaymentEnabled && (
             <button className="btn btn--ghost btn--block" disabled={busy}
-              onClick={() => run(async () => { await data.changePaymentMethod(order.id, 'caja'); onDone(); })}>
+              onClick={() => run(async () => { await data.switchToCounterPayment(order.id, token); onDone(); })}>
               Prefiero pagar en caja
             </button>
           )}
@@ -460,9 +467,9 @@ const progress: { key: Order['prepStatus']; label: string }[] = [
   { key: 'entregado', label: 'Entregado' },
 ];
 
-function Confirmation({ restaurant, orderId, onNew }: { restaurant: Restaurant; orderId: string; onNew: () => void }) {
-  const { value: order } = useOrder(orderId, restaurant.id);
-  if (!order) return <div className="cx"><Spinner /></div>;
+function Confirmation({ restaurant, orderId, token, onNew }: { restaurant: Restaurant; orderId: string; token: string; onNew: () => void }) {
+  const { value: order, loading } = useCustomerOrder(orderId, token);
+  if (!order) return <div className="cx">{loading ? <Spinner /> : <OrderNotFound />}</div>;
   const idx = progress.findIndex((p) => p.key === order.prepStatus);
   const pay = paymentLabel[order.paymentStatus];
   const cancelled = order.prepStatus === 'cancelado';
@@ -518,6 +525,14 @@ function Confirmation({ restaurant, orderId, onNew }: { restaurant: Restaurant; 
 
         <button className="btn btn--outline btn--block" onClick={onNew}>Hacer otro pedido</button>
       </div>
+    </div>
+  );
+}
+
+function OrderNotFound() {
+  return (
+    <div className="cx-body">
+      <Notice tone="danger">No hemos podido cargar tu pedido. Si ya lo enviaste, el restaurante lo ha recibido: indica tu número de mesa o tu nombre al personal.</Notice>
     </div>
   );
 }

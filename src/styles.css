@@ -457,3 +457,11 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* ================= ACCESO DEL PERSONAL ================= */
+.access { align-items: center; padding-block: 48px; }
+.access__card { width: 100%; max-width: 440px; padding: 28px; border-radius: var(--r-lg); background: var(--surface); border: 1px solid var(--line); }
+.access__card h1 { font-size: 1.7rem; font-weight: 800; margin-block: 4px 6px; }
+.session { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session__who { font-size: .85rem; color: var(--muted); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) { .session__who { display: none; } }

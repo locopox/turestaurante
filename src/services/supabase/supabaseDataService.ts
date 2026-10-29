@@ -1,13 +1,17 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Category, Order, Product, Restaurant } from '../../types';
+import type { Category, Order, Product, Restaurant, StaffRole, StaffSession } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 /**
  * Implementación para Supabase. Usa el esquema de `supabase/schema.sql`.
  * Columnas en snake_case en la base de datos ↔ camelCase en la app.
  *
- * Nota: aún no se ha probado contra un proyecto real; es el punto de partida
- * para la fase 2.
+ * Seguridad: solo usa la clave pública. Lo que puede hacer cada usuario lo decide la base de
+ * datos (RLS y funciones). Los clientes anónimos solo llaman a create_order,
+ * get_customer_order y customer_switch_to_counter.
+ *
+ * Nota: el SQL está probado contra PostgreSQL local (supabase/tests); este cliente aún no
+ * se ha probado contra un proyecto real de Supabase.
  */
 type Row = Record<string, any>;
 
@@ -44,24 +48,89 @@ const toOrder = (r: Row): Order => ({
 
 const ORDER_SELECT = '*, order_items(*)';
 
+const CUSTOMER_POLL_MS = 5000;
+
+/** Pedido tal y como lo devuelven las funciones para clientes (ya en camelCase, sin datos privados). */
+const fromCustomerJson = (j: Row): Order => ({
+  id: j.id, restaurantId: j.restaurantId, number: j.number, createdAt: j.createdAt, updatedAt: j.updatedAt,
+  mode: j.mode, table: j.table ?? null, customerName: j.customerName ?? null, customerPhone: null,
+  pickupTime: j.pickupTime ?? null, notes: j.notes ?? '', total: j.total, paymentMethod: j.paymentMethod,
+  paymentStatus: j.paymentStatus, paymentRef: null, prepStatus: j.prepStatus,
+  items: (j.items ?? []).map((i: Row) => ({
+    productId: i.productId, name: i.name, unitPrice: i.unitPrice, quantity: i.quantity, notes: i.notes ?? undefined,
+  })),
+});
+
+/** Traduce los errores técnicos más comunes a mensajes comprensibles. */
+function friendly(message: string): string {
+  if (/permission denied|row-level security|JWT|not authorized/i.test(message)) return 'No tienes permiso para hacer esto. Inicia sesión con una cuenta del restaurante.';
+  // Un UPDATE bloqueado por RLS no da error: simplemente no devuelve ninguna fila.
+  if (/PGRST116|multiple \(or no\) rows|0 rows/i.test(message)) return 'No tienes permiso para modificar esto o ya no existe.';
+  if (/duplicate key.*slug/i.test(message)) return 'Ya existe un restaurante con esa dirección web (slug).';
+  if (/Failed to fetch|NetworkError|fetch failed/i.test(message)) return 'No hay conexión con el servidor. Inténtalo de nuevo.';
+  return message;
+}
+
 export class SupabaseDataService implements DataService {
   readonly kind = 'supabase' as const;
+  readonly requiresLogin = true;
   private client: Promise<SupabaseClient>;
 
   constructor(url: string, anonKey: string) {
-    if (!url || !anonKey) throw new Error('Faltan VITE_SUPABASE_URL o VITE_SUPABASE_ANON_KEY');
     // Carga diferida: el modo demo no descarga supabase-js.
     this.client = import('@supabase/supabase-js').then(({ createClient }) => createClient(url, anonKey));
   }
 
+  // ---------- Sesión del personal ----------
+  async getSession(): Promise<StaffSession | null> {
+    const sb = await this.client;
+    const { data } = await sb.auth.getSession();
+    const user = data.session?.user;
+    if (!user) return null;
+    const [memberships, admin] = await Promise.all([
+      sb.rpc('my_memberships'),
+      sb.from('platform_admins').select('user_id').eq('user_id', user.id).maybeSingle(),
+    ]);
+    if (memberships.error) throw new Error(friendly(memberships.error.message));
+    return {
+      userId: user.id,
+      email: user.email ?? '',
+      isPlatformAdmin: !!admin.data,
+      memberships: ((memberships.data ?? []) as Row[]).map((m) => ({ restaurantId: m.restaurant_id, role: m.role as StaffRole })),
+    };
+  }
+  async signIn(email: string, password: string) {
+    const { error } = await (await this.client).auth.signInWithPassword({ email: email.trim(), password });
+    if (error) throw new Error(/invalid/i.test(error.message) ? 'Email o contraseña incorrectos.' : friendly(error.message));
+    const session = await this.getSession();
+    if (!session) throw new Error('No se pudo iniciar sesión.');
+    return session;
+  }
+  async signOut() {
+    await (await this.client).auth.signOut();
+  }
+  onAuthChange(onChange: () => void) {
+    let unsubscribe = () => {};
+    let closed = false;
+    this.client.then((sb) => {
+      if (closed) return;
+      const { data } = sb.auth.onAuthStateChange(() => onChange());
+      unsubscribe = () => data.subscription.unsubscribe();
+    });
+    return () => {
+      closed = true;
+      unsubscribe();
+    };
+  }
+
   private async one<T>(q: PromiseLike<{ data: any; error: any }>, map: (r: Row) => T): Promise<T> {
     const { data, error } = await q;
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(friendly(error.message));
     return map(data);
   }
   private async many<T>(q: PromiseLike<{ data: any; error: any }>, map: (r: Row) => T): Promise<T[]> {
     const { data, error } = await q;
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(friendly(error.message));
     return (data ?? []).map(map);
   }
 
@@ -70,7 +139,7 @@ export class SupabaseDataService implements DataService {
   }
   async getRestaurantBySlug(slug: string) {
     const { data, error } = await (await this.client).from('restaurants').select('*').eq('slug', slug).maybeSingle();
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(friendly(error.message));
     return data ? toRestaurant(data) : null;
   }
   async createRestaurant(input: Parameters<DataService['createRestaurant']>[0]) {
@@ -97,39 +166,51 @@ export class SupabaseDataService implements DataService {
     return this.one((await this.client).from('products').update(fromProduct(p)).eq('id', p.id).select().single(), toProduct);
   }
 
+  // ---------- Cliente (sin sesión): solo funciones con token ----------
+  async createOrder(input: Parameters<DataService['createOrder']>[0]) {
+    // `create_order` valida, calcula precios y total, numera y es idempotente por token.
+    const { data, error } = await (await this.client).rpc('create_order', { payload: input });
+    if (error) throw new Error(friendly(error.message));
+    return fromCustomerJson(data);
+  }
+  async getCustomerOrder(orderId: string, accessToken: string) {
+    const { data, error } = await (await this.client).rpc('get_customer_order', { p_order_id: orderId, p_token: accessToken });
+    if (error) throw new Error(friendly(error.message));
+    return data ? fromCustomerJson(data) : null;
+  }
+  subscribeCustomerOrder(_orderId: string, _accessToken: string, onChange: () => void) {
+    // El cliente anónimo no puede usar Realtime (no tiene permiso de lectura): consulta cada pocos segundos.
+    const id = setInterval(onChange, CUSTOMER_POLL_MS);
+    const onVisible = () => document.visibilityState === 'visible' && onChange();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }
+  async switchToCounterPayment(orderId: string, accessToken: string) {
+    const { data, error } = await (await this.client).rpc('customer_switch_to_counter', { p_order_id: orderId, p_token: accessToken });
+    if (error) throw new Error(friendly(error.message));
+    return fromCustomerJson(data);
+  }
+
+  // ---------- Personal (con sesión) ----------
   async listOrders(restaurantId: string) {
     return this.many(
       (await this.client).from('orders').select(ORDER_SELECT).eq('restaurant_id', restaurantId).order('created_at', { ascending: false }).limit(200),
       toOrder,
     );
   }
-  async getOrder(orderId: string) {
-    const { data, error } = await (await this.client).from('orders').select(ORDER_SELECT).eq('id', orderId).maybeSingle();
-    if (error) throw new Error(error.message);
-    return data ? toOrder(data) : null;
-  }
-  async createOrder(input: Parameters<DataService['createOrder']>[0]) {
-    // La función SQL `create_order` valida productos, calcula precios y asigna el número.
-    const { data, error } = await (await this.client).rpc('create_order', { payload: input });
-    if (error) throw new Error(error.message);
-    const order = await this.getOrder(data as string);
-    if (!order) throw new Error('No se pudo leer el pedido creado');
-    return order;
-  }
-  private async update(orderId: string, patch: Row) {
-    return this.one((await this.client).from('orders').update(patch).eq('id', orderId).select(ORDER_SELECT).single(), toOrder);
-  }
   async updatePrepStatus(orderId: string, status: Order['prepStatus']) {
-    return this.update(orderId, { prep_status: status });
-  }
-  async changePaymentMethod(orderId: string, method: Order['paymentMethod']) {
-    return this.update(orderId, { payment_method: method, payment_status: method === 'caja' ? 'pendiente_caja' : 'pendiente_online' });
+    const { error } = await (await this.client).rpc('staff_set_prep_status', { p_order_id: orderId, p_status: status });
+    if (error) throw new Error(friendly(error.message));
   }
   async markPaidAtCounter(orderId: string) {
-    return this.update(orderId, { payment_status: 'cobrado_caja' });
+    const { error } = await (await this.client).rpc('staff_mark_paid_at_counter', { p_order_id: orderId });
+    if (error) throw new Error(friendly(error.message));
   }
   async recordPaymentResult(): Promise<Order> {
-    throw new Error('Con Supabase, el estado del pago lo actualiza la Edge Function del webhook del proveedor.');
+    throw new Error('Con Supabase, el estado del pago solo lo actualiza el servidor tras la confirmación del proveedor de pagos.');
   }
 
   private listen(name: string, tables: { table: string; filter?: string }[], onChange: () => void) {

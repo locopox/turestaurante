@@ -1,6 +1,6 @@
 import type {
-  Category, NewOrderInput, NewRestaurantInput, Order, PaymentMethod, PaymentStatus,
-  PrepStatus, Product, Restaurant,
+  Category, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
+  PrepStatus, Product, Restaurant, StaffSession,
 } from '../types';
 
 export interface Menu {
@@ -17,6 +17,14 @@ export type Unsubscribe = () => void;
  */
 export interface DataService {
   readonly kind: 'mock' | 'supabase';
+  /** true si el panel, la cocina y la administración exigen iniciar sesión. */
+  readonly requiresLogin: boolean;
+
+  // Sesión del personal
+  getSession(): Promise<StaffSession | null>;
+  signIn(email: string, password: string): Promise<StaffSession>;
+  signOut(): Promise<void>;
+  onAuthChange(onChange: () => void): Unsubscribe;
 
   // Restaurantes (multi-tenant)
   listRestaurants(): Promise<Restaurant[]>;
@@ -30,25 +38,26 @@ export interface DataService {
   createProduct(input: Omit<Product, 'id' | 'sort'>): Promise<Product>;
   saveProduct(product: Product): Promise<Product>;
 
-  // Pedidos
-  listOrders(restaurantId: string): Promise<Order[]>;
-  getOrder(orderId: string): Promise<Order | null>;
-  /** Calcula precios y número de pedido en el servidor. */
+  // Cliente (sin cuenta): solo accede a SU pedido mediante el token secreto
+  /** Valida, calcula precios y numera en el servidor. Reenviar el mismo token devuelve el mismo pedido. */
   createOrder(input: NewOrderInput): Promise<Order>;
-  updatePrepStatus(orderId: string, status: PrepStatus): Promise<Order>;
-  /** Cambia el método (p. ej. el cliente abandona el pago online y pagará en caja). */
-  changePaymentMethod(orderId: string, method: PaymentMethod): Promise<Order>;
-  /** El personal confirma que ha cobrado en caja. */
-  markPaidAtCounter(orderId: string): Promise<Order>;
-  /**
-   * Actualización de pago desde el proveedor. En producción la hace la Edge Function
-   * del webhook con la service role; desde el navegador solo se permite en modo demo.
-   */
-  recordPaymentResult(orderId: string, status: PaymentStatus, ref: string | null): Promise<Order>;
+  getCustomerOrder(orderId: string, accessToken: string): Promise<Order | null>;
+  subscribeCustomerOrder(orderId: string, accessToken: string, onChange: () => void): Unsubscribe;
+  /** El cliente abandona el pago online pendiente y pagará en caja. */
+  switchToCounterPayment(orderId: string, accessToken: string): Promise<Order>;
 
-  // Tiempo real
+  // Personal (con sesión y según su rol)
+  listOrders(restaurantId: string): Promise<Order[]>;
+  updatePrepStatus(orderId: string, status: PrepStatus): Promise<void>;
+  markPaidAtCounter(orderId: string): Promise<void>;
   subscribeOrders(restaurantId: string, onChange: () => void): Unsubscribe;
   subscribeCatalog(onChange: () => void): Unsubscribe;
+
+  /**
+   * Resultado de la pasarela SIMULADA del modo demo. Con Supabase lanza error: el estado del
+   * pago solo lo cambia el servidor tras la confirmación firmada del proveedor.
+   */
+  recordPaymentResult(orderId: string, status: PaymentStatus, ref: string | null): Promise<Order>;
 
   /** Solo demo: restaura los datos de ejemplo. */
   resetDemo?(): Promise<void>;

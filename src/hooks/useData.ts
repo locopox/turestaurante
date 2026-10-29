@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { data, type Menu } from '../services';
-import type { Order, Restaurant } from '../types';
+import type { Order, Restaurant, StaffSession } from '../types';
 
 interface Loadable<T> {
   value: T | undefined;
@@ -52,12 +52,16 @@ export const useOrders = (restaurantId: string | undefined) =>
     [restaurantId],
   );
 
-export const useOrder = (orderId: string | null, restaurantId: string | undefined) =>
+/** Pedido del cliente: solo se puede leer con su token secreto. */
+export const useCustomerOrder = (orderId: string | null, accessToken: string | null) =>
   useLoad<Order | null>(
-    () => (orderId ? data.getOrder(orderId) : Promise.resolve(null)),
-    restaurantId ? (cb) => data.subscribeOrders(restaurantId, cb) : null,
-    [orderId, restaurantId],
+    () => (orderId && accessToken ? data.getCustomerOrder(orderId, accessToken) : Promise.resolve(null)),
+    orderId && accessToken ? (cb) => data.subscribeCustomerOrder(orderId, accessToken, cb) : null,
+    [orderId, accessToken],
   );
+
+/** Sesión del personal. `value` es null si no hay sesión. */
+export const useSession = () => useLoad<StaffSession | null>(() => data.getSession(), (cb) => data.onAuthChange(cb), []);
 
 /** Reloj que se actualiza periódicamente (tiempos de espera en cocina). */
 export function useNow(intervalMs = 30000) {

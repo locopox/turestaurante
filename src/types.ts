@@ -109,4 +109,23 @@ export interface NewOrderInput {
   items: { productId: string; quantity: number; notes?: string }[];
   notes?: string;
   paymentMethod: PaymentMethod;
+  /**
+   * Secreto aleatorio (64 caracteres hex) generado en el navegador. Permite al cliente
+   * leer SOLO su pedido y hace la creación idempotente: reenviarlo no duplica el pedido.
+   */
+  accessToken: string;
+}
+
+export type StaffRole = 'owner' | 'manager' | 'waiter' | 'kitchen';
+
+export interface Membership {
+  restaurantId: string;
+  role: StaffRole;
+}
+
+export interface StaffSession {
+  userId: string;
+  email: string;
+  isPlatformAdmin: boolean;
+  memberships: Membership[];
 }
