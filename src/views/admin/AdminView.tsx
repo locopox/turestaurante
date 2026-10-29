@@ -3,17 +3,20 @@ import { useEffect, useMemo, useState } from 'react';
 import { ART_OPTIONS, FoodArt } from '../../components/FoodArt';
 import { useToast } from '../../components/Toast';
 import { Badge, Icon, Modal, Notice, Spinner } from '../../components/ui';
-import { config } from '../../config';
+import { config, onlinePaymentsAvailable } from '../../config';
 import { useMenu, useOrders, useRestaurants } from '../../hooks/useData';
 import { hrefFor } from '../../hooks/useRoute';
 import { formatPrice, slugify } from '../../lib/format';
 import { data } from '../../services';
-import type { FoodArt as Art, Product, Restaurant } from '../../types';
+import { can } from '../../lib/permissions';
+import type { FoodArt as Art, Product, Restaurant, StaffSession } from '../../types';
 
 type Tab = 'datos' | 'carta' | 'qr';
 
-export function AdminView({ selectedId, onSelect }: { selectedId: string; onSelect: (id: string) => void }) {
-  const { value: restaurants = [], loading } = useRestaurants();
+export function AdminView({ selectedId, onSelect, session }: { selectedId: string; onSelect: (id: string) => void; session: StaffSession | null }) {
+  const { value: all = [], loading } = useRestaurants();
+  // Solo los restaurantes que este usuario puede administrar (la base de datos lo aplica igualmente).
+  const restaurants = all.filter((r) => can(session, r.id, 'restaurant.edit'));
   const [tab, setTab] = useState<Tab>('datos');
   const [creating, setCreating] = useState(false);
   const current = restaurants.find((r) => r.id === selectedId) ?? restaurants[0];
@@ -25,7 +28,9 @@ export function AdminView({ selectedId, onSelect }: { selectedId: string; onSele
           <span className="eyebrow">Administración de la plataforma</span>
           <h1>Restaurantes</h1>
         </div>
-        <button className="btn btn--primary" onClick={() => setCreating(true)}><Icon name="plus" /> Nuevo restaurante</button>
+        {can(session, undefined, 'restaurant.create') && (
+          <button className="btn btn--primary" onClick={() => setCreating(true)}><Icon name="plus" /> Nuevo restaurante</button>
+        )}
       </header>
 
       {loading && !restaurants.length ? <Spinner /> : (
@@ -82,11 +87,11 @@ function RestaurantSummary({ restaurant }: { restaurant: Restaurant }) {
   );
 }
 
-function Toggle({ id, label, hint, checked, onChange }: { id: string; label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void }) {
+function Toggle({ id, label, hint, checked, onChange, disabled }: { id: string; label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
     <label className="toggle" htmlFor={id}>
       <span><strong>{label}</strong>{hint && <span className="muted small">{hint}</span>}</span>
-      <input id={id} type="checkbox" role="switch" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <input id={id} type="checkbox" role="switch" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       <span className="toggle__track" aria-hidden="true" />
     </label>
   );
@@ -122,7 +127,11 @@ function RestaurantForm({ restaurant }: { restaurant: Restaurant }) {
       <div className="toggles">
         <Toggle id="rf-active" label="Acepta pedidos" hint="Si está desactivado, los clientes ven la carta cerrada." checked={r.active} onChange={(v) => set('active', v)} />
         <Toggle id="rf-pickup" label="Pedidos para recoger" checked={r.pickupEnabled} onChange={(v) => set('pickupEnabled', v)} />
-        <Toggle id="rf-online" label="Pago online" hint={config.paymentProvider === 'simulado' ? 'Pasarela simulada hasta conectar un proveedor.' : undefined} checked={r.onlinePaymentEnabled} onChange={(v) => set('onlinePaymentEnabled', v)} />
+        {onlinePaymentsAvailable ? (
+          <Toggle id="rf-online" label="Pago online" hint="Pasarela simulada de la demo: no cobra nada." checked={r.onlinePaymentEnabled} onChange={(v) => set('onlinePaymentEnabled', v)} />
+        ) : (
+          <Toggle id="rf-online" label="Pago online" hint="Desactivado hasta integrar un proveedor de pagos real." checked={false} disabled onChange={() => {}} />
+        )}
         <Toggle id="rf-counter" label="Pago en caja" checked={r.counterPaymentEnabled} onChange={(v) => set('counterPaymentEnabled', v)} />
       </div>
       <div className="row">
@@ -153,9 +162,13 @@ function MenuEditor({ restaurant }: { restaurant: Restaurant }) {
         <form className="row" onSubmit={async (e) => {
           e.preventDefault();
           if (!newCat.trim()) return;
-          await data.createCategory(restaurant.id, newCat.trim());
-          toast(`Categoría «${newCat.trim()}» creada`);
-          setNewCat('');
+          try {
+            await data.createCategory(restaurant.id, newCat.trim());
+            toast(`Categoría «${newCat.trim()}» creada`);
+            setNewCat('');
+          } catch (err) {
+            toast((err as Error).message, 'danger');
+          }
         }}>
           <label className="sr-only" htmlFor="new-cat">Nueva categoría</label>
           <input id="new-cat" className="input" value={newCat} onChange={(e) => setNewCat(e.target.value)} placeholder="Nueva categoría" />
@@ -216,13 +229,17 @@ function AddProduct({ open, restaurant, categories, onClose }: {
     e.preventDefault();
     const price = Math.round(parseFloat(f.price.replace(',', '.')) * 100);
     if (!f.name.trim() || !Number.isFinite(price)) return toast('Indica nombre y precio.', 'danger');
-    await data.createProduct({
-      restaurantId: restaurant.id, categoryId: f.categoryId || categories[0].id, name: f.name.trim(), description: f.description.trim(),
-      price, art: f.art, imageUrl: null, allergens: f.allergens.split(',').map((s) => s.trim()).filter(Boolean), tags: [], available: true,
-    });
-    toast(`${f.name.trim()} añadido a la carta`);
-    setF({ name: '', description: '', price: '', categoryId: '', art: 'pizza', allergens: '' });
-    onClose();
+    try {
+      await data.createProduct({
+        restaurantId: restaurant.id, categoryId: f.categoryId || categories[0].id, name: f.name.trim(), description: f.description.trim(),
+        price, art: f.art, imageUrl: null, allergens: f.allergens.split(',').map((s) => s.trim()).filter(Boolean), tags: [], available: true,
+      });
+      toast(`${f.name.trim()} añadido a la carta`);
+      setF({ name: '', description: '', price: '', categoryId: '', art: 'pizza', allergens: '' });
+      onClose();
+    } catch (err) {
+      toast((err as Error).message, 'danger');
+    }
   };
   return (
     <Modal open={open} onClose={onClose} title="Añadir producto">
