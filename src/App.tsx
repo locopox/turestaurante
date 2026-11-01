@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { ToastProvider } from './components/Toast';
-import { ConfigScreen, LoginScreen } from './components/StaffAccess';
-import { Icon, Notice, Spinner } from './components/ui';
+import { ChangePasswordForm, ConfigScreen, LoginScreen, SetPasswordScreen } from './components/StaffAccess';
+import { Icon, Modal, Notice, Spinner } from './components/ui';
 import { configBlocked, isDemo } from './config';
 import { useRestaurants, useSession } from './hooks/useData';
 import { useRoute, type Route } from './hooks/useRoute';
+import { staffGate } from './lib/authRedirect';
 import { can, roleIn, roleLabel } from './lib/permissions';
 import { safeStorage } from './lib/storage';
 import { data } from './services';
@@ -39,10 +40,19 @@ function AppContent() {
   const customerRestaurant = route.view === 'cliente' && route.slug
     ? restaurants.find((r) => r.slug === route.slug) : selected;
 
+  const recoveryPending = data.isPasswordRecoveryPending();
+  const authRedirect = data.getAuthRedirect();
+  // Qué puede verse según la sesión. Con una recuperación de contraseña pendiente, la única
+  // pantalla accesible es la de fijar la contraseña (ver staffGate).
+  const gate = staffGate({
+    isStaffView: staffView, requiresLogin: data.requiresLogin, sessionLoading, hasSession: !!session, recoveryPending,
+  });
+
   let body;
+  if (gate === 'set-password' && session) body = <SetPasswordScreen email={session.email} onDone={reloadSession} />;
   // En las vistas del personal, la sesión va primero: sin ella no se carga nada más.
-  if (needsLogin && sessionLoading && !session) body = <Spinner />;
-  else if (needsLogin && !session) body = <LoginScreen onSignedIn={reloadSession} />;
+  else if (gate === 'loading') body = <Spinner />;
+  else if (gate === 'login') body = <LoginScreen onSignedIn={reloadSession} />;
   else if (error) body = <div className="page"><Notice tone="danger">No se pudo conectar con los datos: {error}</Notice></div>;
   else if (loading && !restaurants.length) body = <Spinner />;
   else if (route.view === 'cliente')
@@ -67,8 +77,20 @@ function AppContent() {
       <a className="skip" href="#main">Saltar al contenido</a>
       <AppBar route={route} restaurants={staffView ? selectable : restaurants} selectedId={selected?.id ?? ''} onSelect={setSelectedId}
         customerName={route.view === 'cliente' ? customerRestaurant?.name : undefined}
-        session={data.requiresLogin ? session : null} selectedRole={roleIn(session, selected?.id)} onSignOut={reloadSession} />
-      <main id="main" className={route.view === 'cliente' ? 'main main--customer' : 'main'}>{body}</main>
+        session={data.requiresLogin ? session : null} selectedRole={roleIn(session, selected?.id)} onSignOut={reloadSession}
+        canChangePassword={!!session && data.requiresLogin && !recoveryPending} />
+      <main id="main" className={route.view === 'cliente' ? 'main main--customer' : 'main'}>
+        {authRedirect.kind === 'error' && (
+          <div className="page page--notice">
+            <Notice tone="warn">
+              {authRedirect.message}{' '}
+              <a href="#panel">Ir a iniciar sesión</a>{' · '}
+              <button type="button" className="link-btn" onClick={() => { data.dismissAuthRedirect(); reloadSession(); }}>Cerrar aviso</button>
+            </Notice>
+          </div>
+        )}
+        {body}
+      </main>
     </ToastProvider>
   );
 }
@@ -85,11 +107,12 @@ const nav: { view: Route['view']; label: string; href: string; icon: string }[] 
   { view: 'admin', label: 'Admin', href: '#admin', icon: 'settings' },
 ];
 
-function AppBar({ route, restaurants, selectedId, onSelect, customerName, session, selectedRole, onSignOut }: {
+function AppBar({ route, restaurants, selectedId, onSelect, customerName, session, selectedRole, onSignOut, canChangePassword }: {
   route: Route; restaurants: { id: string; name: string }[]; selectedId: string; onSelect: (id: string) => void; customerName?: string;
-  session: StaffSession | null; selectedRole: StaffRole | null; onSignOut: () => void;
+  session: StaffSession | null; selectedRole: StaffRole | null; onSignOut: () => void; canChangePassword: boolean;
 }) {
   const [resetAsk, setResetAsk] = useState(false);
+  const [changingPassword, setChangingPassword] = useState(false);
   // Con sesión, se ocultan las secciones a las que el rol no tiene acceso.
   const visibleNav = nav.filter((n) => {
     if (!session) return true;
@@ -130,9 +153,15 @@ function AppBar({ route, restaurants, selectedId, onSelect, customerName, sessio
               <span className="session__who" title={session.email}>
                 {session.email}{selectedRole ? ` · ${roleLabel[selectedRole]}` : ''}
               </span>
+              {canChangePassword && (
+                <button className="btn btn--sm btn--ghost" onClick={() => setChangingPassword(true)}>Contraseña</button>
+              )}
               <button className="btn btn--sm btn--ghost" onClick={async () => { await data.signOut(); onSignOut(); }}>Salir</button>
             </span>
           )}
+          <Modal open={changingPassword} onClose={() => setChangingPassword(false)} title="Cambiar contraseña">
+            <ChangePasswordForm onDone={() => setChangingPassword(false)} />
+          </Modal>
           {data.resetDemo && (resetAsk ? (
             <span className="reset-ask">
               <button className="btn btn--sm btn--danger" onClick={async () => { await data.resetDemo!(); setResetAsk(false); }}>Reiniciar</button>

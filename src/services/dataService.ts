@@ -1,3 +1,4 @@
+import type { AuthRedirect } from '../lib/authRedirect';
 import type {
   Category, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
   PrepStatus, Product, Restaurant, StaffSession,
@@ -25,6 +26,21 @@ export interface DataService {
   signIn(email: string, password: string): Promise<StaffSession>;
   signOut(): Promise<void>;
   onAuthChange(onChange: () => void): Unsubscribe;
+
+  // Contraseña (Supabase Auth, siempre con la sesión del propio usuario y la clave pública)
+  /** Enlace de Supabase Auth con el que se abrió la app (recuperación o enlace caducado). */
+  getAuthRedirect(): AuthRedirect;
+  dismissAuthRedirect(): void;
+  /** true tras abrir un enlace de recuperación válido, hasta fijar la contraseña nueva. */
+  isPasswordRecoveryPending(): boolean;
+  /** Fija la contraseña nueva del usuario que abrió el enlace de recuperación. */
+  setNewPassword(newPassword: string): Promise<void>;
+  /** Cambia la contraseña comprobando antes la actual. No cierra la sesión actual. */
+  changePassword(currentPassword: string, newPassword: string, signOutOtherDevices: boolean): Promise<void>;
+  /** Envía el correo de recuperación. No revela si el email tiene cuenta. */
+  requestPasswordReset(email: string): Promise<void>;
+  /** El usuario decide no fijar la contraseña ahora: cierra su sesión (solo si lo pide). */
+  cancelPasswordRecovery(): Promise<void>;
 
   // Restaurantes (multi-tenant)
   listRestaurants(): Promise<Restaurant[]>;

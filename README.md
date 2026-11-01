@@ -115,6 +115,25 @@ npm run test:db   # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase
 7. `npm run dev` y comprueba: un pedido en caja desde una ventana de incógnito (`#pedir-la-piazza-mesa-5`)
    aparece en el panel y en cocina tras iniciar sesión; el cliente ve el cambio de estado en unos segundos.
 
+## Contraseñas del personal
+
+- **¿Has olvidado tu contraseña?** (pantalla de inicio de sesión): envía un correo con un enlace que vuelve a la app.
+  Supabase responde igual exista o no el email, así que no revela qué cuentas existen.
+- Al abrir el enlace, la app muestra **«Elige una contraseña nueva»**. Hasta guardarla no se puede usar el panel,
+  la cocina ni la administración; después se aplican los permisos normales del rol. Un enlace caducado o ya usado
+  muestra un aviso y no abre sesión.
+- **Contraseña** (junto a «Salir»): cambia la contraseña con la sesión iniciada. Pide la actual y no cierra esta
+  sesión; opcionalmente cierra las de otros dispositivos.
+- Todo usa Supabase Auth con la sesión del propio usuario y la clave pública. No hace falta `service_role`.
+
+Configuración necesaria en Supabase (**Authentication → URL Configuration**):
+
+- **Site URL**: la dirección de la app (en local, `http://localhost:5173`).
+- **Redirect URLs**: añade `http://localhost:5173/**` (y más adelante el dominio real). Si la dirección no está en
+  esta lista, Supabase envía el enlace a la Site URL.
+
+El servidor de correo incluido en Supabase limita los envíos por hora: no pidas muchos enlaces seguidos.
+
 ## Pagos reales (fase siguiente, no implementada)
 
 La base de datos ya está preparada; falta la pasarela. **Nada en la app llama todavía a estas funciones.**

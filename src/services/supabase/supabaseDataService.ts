@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { friendlyAuthError, parseAuthRedirect, PASSWORD_MIN, type AuthRedirect } from '../../lib/authRedirect';
 import type { Category, Order, Product, Restaurant, StaffRole, StaffSession } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
@@ -71,15 +72,78 @@ function friendly(message: string): string {
   return message;
 }
 
+/** Lo que el servicio necesita del navegador. Se puede sustituir en las pruebas. */
+export interface BrowserEnv {
+  location: { hash: string; search: string; origin: string; pathname: string };
+  history: { state: unknown; replaceState(data: unknown, unused: string, url?: string): void } | null;
+  storage: { getItem(k: string): string | null; setItem(k: string, v: string): void; removeItem(k: string): void } | null;
+}
+
+function browserEnv(): BrowserEnv | null {
+  if (typeof window === 'undefined') return null;
+  let storage: BrowserEnv['storage'] = null;
+  try {
+    storage = window.sessionStorage;
+  } catch {
+    storage = null;
+  }
+  return { location: window.location, history: window.history, storage };
+}
+
+/** Marca de «recuperación pendiente», solo para esta pestaña (sessionStorage). */
+const RECOVERY_KEY = 'turestaurante:recuperar-contrasena';
+
 export class SupabaseDataService implements DataService {
   readonly kind = 'supabase' as const;
   readonly requiresLogin = true;
   private client: Promise<SupabaseClient>;
+  private env: BrowserEnv | null;
+  private redirect: AuthRedirect;
+  private authListeners = new Set<() => void>();
 
-  constructor(url: string, anonKey: string) {
+  constructor(url: string, anonKey: string, deps: { createClient?: () => Promise<SupabaseClient>; env?: BrowserEnv | null } = {}) {
+    this.env = deps.env !== undefined ? deps.env : browserEnv();
+    // Se lee ANTES de crear el cliente: supabase-js borra los datos del enlace al procesarlo.
+    this.redirect = this.env ? parseAuthRedirect(this.env.location.hash, this.env.location.search) : { kind: 'none' };
+    if (this.redirect.kind === 'recovery') this.setRecoveryFlag(true);
+    if (this.redirect.kind === 'error' && this.env?.history) {
+      // Quita el error de la dirección para que no se repita al recargar.
+      this.env.history.replaceState(this.env.history.state, '', this.env.location.pathname);
+    }
     // Carga diferida: el modo demo no descarga supabase-js.
-    this.client = import('@supabase/supabase-js').then(({ createClient }) => createClient(url, anonKey));
+    const create = deps.createClient
+      ?? (() => import('@supabase/supabase-js').then(({ createClient }) => createClient(url, anonKey)));
+    this.client = create().then((sb) => {
+      // Suscripción inmediata: el evento PASSWORD_RECOVERY se emite nada más procesar el enlace.
+      sb.auth.onAuthStateChange((event, session) => {
+        if (event === 'PASSWORD_RECOVERY') this.setRecoveryFlag(true);
+        // Sin sesión (enlace no válido o sesión cerrada), la recuperación ya no está pendiente.
+        if (event === 'SIGNED_OUT' || (event === 'INITIAL_SESSION' && !session)) this.setRecoveryFlag(false);
+        // Si el enlace no pudo procesarse (token no válido, sin conexión…), supabase-js deja los
+        // tokens en la dirección. Se quitan para que no queden visibles ni en el historial.
+        if (event === 'INITIAL_SESSION' && this.env?.history && /(^|[#&])(access_token|refresh_token)=/.test(this.env.location.hash)) {
+          this.env.history.replaceState(this.env.history.state, '', this.env.location.pathname + this.env.location.search);
+        }
+        // Fuera del callback: supabase-js recomienda no llamar a Supabase dentro de él.
+        setTimeout(() => this.emitAuth(), 0);
+      });
+      return sb;
+    });
   }
+
+  private emitAuth() {
+    this.authListeners.forEach((l) => l());
+  }
+  private setRecoveryFlag(on: boolean) {
+    try {
+      if (on) this.env?.storage?.setItem(RECOVERY_KEY, '1');
+      else this.env?.storage?.removeItem(RECOVERY_KEY);
+    } catch {
+      /* sin almacenamiento: solo dura mientras la página esté abierta */
+    }
+    this.recoveryInMemory = on;
+  }
+  private recoveryInMemory = false;
 
   // ---------- Sesión del personal ----------
   async getSession(): Promise<StaffSession | null> {
@@ -102,6 +166,8 @@ export class SupabaseDataService implements DataService {
   async signIn(email: string, password: string) {
     const { error } = await (await this.client).auth.signInWithPassword({ email: email.trim(), password });
     if (error) throw new Error(/invalid/i.test(error.message) ? 'Email o contraseña incorrectos.' : friendly(error.message));
+    // Quien entra con su contraseña ya no está recuperándola.
+    this.setRecoveryFlag(false);
     const session = await this.getSession();
     if (!session) throw new Error('No se pudo iniciar sesión.');
     return session;
@@ -110,17 +176,71 @@ export class SupabaseDataService implements DataService {
     await (await this.client).auth.signOut();
   }
   onAuthChange(onChange: () => void) {
-    let unsubscribe = () => {};
-    let closed = false;
-    this.client.then((sb) => {
-      if (closed) return;
-      const { data } = sb.auth.onAuthStateChange(() => onChange());
-      unsubscribe = () => data.subscription.unsubscribe();
-    });
-    return () => {
-      closed = true;
-      unsubscribe();
-    };
+    this.authListeners.add(onChange);
+    return () => void this.authListeners.delete(onChange);
+  }
+
+  // ---------- Contraseña ----------
+  getAuthRedirect() {
+    return this.redirect;
+  }
+  dismissAuthRedirect() {
+    this.redirect = { kind: 'none' };
+    this.emitAuth();
+  }
+  isPasswordRecoveryPending() {
+    try {
+      const stored = this.env?.storage?.getItem(RECOVERY_KEY);
+      if (stored != null) return stored === '1';
+    } catch {
+      /* usar el valor en memoria */
+    }
+    return this.recoveryInMemory;
+  }
+  async setNewPassword(newPassword: string) {
+    if (newPassword.length < PASSWORD_MIN) throw new Error(`La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.`);
+    const sb = await this.client;
+    // Usa la sesión abierta por el enlace de recuperación (o la del propio usuario).
+    const { error } = await sb.auth.updateUser({ password: newPassword });
+    if (error) throw new Error(friendlyAuthError(error));
+    this.setRecoveryFlag(false);
+    this.emitAuth();
+  }
+  async changePassword(currentPassword: string, newPassword: string, signOutOtherDevices: boolean) {
+    const sb = await this.client;
+    const { data } = await sb.auth.getSession();
+    const email = data.session?.user.email;
+    if (!email) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.');
+    // Comprobar la contraseña actual. Si es incorrecta, Supabase devuelve error y la sesión
+    // actual se mantiene intacta.
+    const check = await sb.auth.signInWithPassword({ email, password: currentPassword });
+    if (check.error) {
+      throw new Error(/invalid login credentials/i.test(check.error.message) || check.error.code === 'invalid_credentials'
+        ? 'La contraseña actual no es correcta.'
+        : friendlyAuthError(check.error));
+    }
+    await this.setNewPassword(newPassword);
+    // Solo si el usuario lo pide. Nunca cierra la sesión actual.
+    if (signOutOtherDevices) {
+      const { error } = await sb.auth.signOut({ scope: 'others' });
+      if (error) throw new Error('La contraseña se ha cambiado, pero no se pudieron cerrar las otras sesiones.');
+    }
+  }
+  async requestPasswordReset(email: string) {
+    const clean = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean)) throw new Error('Escribe un email válido.');
+    const sb = await this.client;
+    // El enlace vuelve a esta misma app. La dirección debe estar en «Redirect URLs» de Supabase;
+    // si no lo está, Supabase usa la «Site URL» del proyecto.
+    const redirectTo = this.env ? this.env.location.origin + this.env.location.pathname : undefined;
+    const { error } = await sb.auth.resetPasswordForEmail(clean, redirectTo ? { redirectTo } : undefined);
+    // Supabase no indica si el email existe. Solo se muestran errores generales (p. ej. límite de envíos).
+    if (error) throw new Error(friendlyAuthError(error));
+  }
+  async cancelPasswordRecovery() {
+    this.setRecoveryFlag(false);
+    await (await this.client).auth.signOut({ scope: 'local' });
+    this.emitAuth();
   }
 
   private async one<T>(q: PromiseLike<{ data: any; error: any }>, map: (r: Row) => T): Promise<T> {

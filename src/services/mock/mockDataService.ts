@@ -86,6 +86,25 @@ export class MockDataService implements DataService {
     return () => {};
   }
 
+  // Contraseñas: en la demo no hay cuentas ni inicio de sesión.
+  getAuthRedirect() {
+    return { kind: 'none' } as const;
+  }
+  dismissAuthRedirect() {}
+  isPasswordRecoveryPending() {
+    return false;
+  }
+  async setNewPassword(): Promise<void> {
+    throw new Error('En el modo demo no hay contraseñas.');
+  }
+  async changePassword(): Promise<void> {
+    throw new Error('En el modo demo no hay contraseñas.');
+  }
+  async requestPasswordReset(): Promise<void> {
+    throw new Error('En el modo demo no hay contraseñas.');
+  }
+  async cancelPasswordRecovery() {}
+
   // Restaurantes
   async listRestaurants() {
     return this.delay([...this.db.restaurants].sort((a, b) => a.name.localeCompare(b.name, 'es')));

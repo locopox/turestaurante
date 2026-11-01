@@ -465,3 +465,6 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .session { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .session__who { font-size: .85rem; color: var(--muted); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 640px) { .session__who { display: none; } }
+.notice--ok { background: var(--ok-soft); color: var(--ink); } .notice--ok .icon { color: var(--ok); }
+.page--notice { padding-block: 16px 0; }
+.link-btn { border: 0; background: none; padding: 0; color: var(--brand); text-decoration: underline; cursor: pointer; font: inherit; }
