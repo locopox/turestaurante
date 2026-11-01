@@ -8,17 +8,21 @@
  *  - Permisos: TODA la decisión la toma SQL (invitation_create, platform_create_restaurant,
  *    invitation_resend) ejecutado CON EL JWT DE QUIEN LLAMA. La clave secreta no decide nada.
  *  - Clave secreta: solo para `auth.admin.inviteUserByEmail` y las funciones de entrega
- *    (invitation_delivery, invitation_mark_sent). AdminApi no expone nada más.
+ *    (invitation_delivery_claim / _finish / _pending). AdminApi no expone nada más.
  *  - La respuesta a quien invita es la MISMA tenga o no cuenta el correo, sea de otro restaurante
- *    o de la plataforma, y se haya enviado o no el correo. Tampoco depende del tiempo de envío
- *    (tiempo mínimo de respuesta).
+ *    o de la plataforma. Se da en cuanto SQL crea la invitación: el correo se envía DESPUÉS, en
+ *    segundo plano (EdgeRuntime.waitUntil), así que ni la respuesta ni su duración dependen del envío.
+ *  - Entrega fiable: el estado vive en la base de datos (reserva con caducidad, intentos y espera
+ *    entre reintentos). Si la función se interrumpe, la entrega queda pendiente y la recupera la
+ *    siguiente llamada a la función (como mucho `sweepLimit` por llamada).
  *  - La dirección de vuelta del correo es APP_URL (secreto de la función). Nunca se lee del
  *    navegador.
  *  - Los registros (logs) no incluyen correos, JWT ni claves.
  */
 
 export type StaffRole = 'owner' | 'manager' | 'waiter' | 'kitchen';
-export type SendResult = 'enviada' | 'fallida' | 'no_necesario';
+/** Resultado que se anota con invitation_delivery_finish. */
+export type FinishResult = 'enviada' | 'no_necesario' | 'reintentar' | 'fallida';
 
 export interface RpcError {
   code?: string;
@@ -44,21 +48,25 @@ export interface UserApi {
   rpc<T>(fn: UserRpc, args: Record<string, unknown>): Promise<RpcResult<T>>;
 }
 
-/** Fila de invitation_delivery (solo el servidor la ve). */
-export interface DeliveryRow {
+/** Fila de invitation_delivery_claim (solo el servidor la ve). Vacía si no se pudo reservar. */
+export interface ClaimRow {
+  claim: string;
+  attempt: number;
   email: string;
   role: StaffRole;
   restaurant_name: string;
-  expires_at: string;
   account_exists: boolean;
   account_confirmed: boolean;
-  state: string;
 }
 
-/** Operaciones con la clave secreta. SOLO estas tres. */
+/** Operaciones con la clave secreta. SOLO estas cuatro. */
 export interface AdminApi {
-  delivery(invitationId: string): Promise<RpcResult<DeliveryRow[]>>;
-  markSent(invitationId: string, result: SendResult): Promise<RpcResult<unknown>>;
+  /** Reserva atómica de la entrega (dos procesos nunca reservan la misma). */
+  claim(invitationId: string): Promise<RpcResult<ClaimRow[]>>;
+  /** Anota el resultado; false si la reserva ya no es la vigente. */
+  finish(invitationId: string, claim: string, result: FinishResult): Promise<RpcResult<boolean>>;
+  /** Entregas atrasadas o interrumpidas (como mucho 10). */
+  pending(limit: number): Promise<RpcResult<string[]>>;
   inviteUserByEmail(email: string, redirectTo: string): Promise<{ error: AuthError | null }>;
 }
 
@@ -67,27 +75,23 @@ export interface InvitationsConfig {
   appUrl: string;
   /** Orígenes del navegador admitidos (CORS). */
   allowedOrigins: string[];
-  /** Tiempo mínimo de respuesta tras autenticar (ms), para que no se note si hubo envío. */
-  minResponseMs: number;
-  /** Espera antes del único reintento de envío ante un fallo temporal (ms). */
-  retryDelayMs: number;
+  /** Entregas atrasadas o interrumpidas que recupera cada llamada (1-10). */
+  sweepLimit: number;
 }
 
 export interface InvitationsDeps {
   config: InvitationsConfig;
   forUser(jwt: string): UserApi;
   admin: AdminApi;
-  now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
+  /** Ejecuta la tarea después de responder (EdgeRuntime.waitUntil). La tarea nunca lanza. */
+  background(task: Promise<void>): void;
   /** Registro de eventos. Nunca recibe correos, JWT ni claves. */
   log?: (event: string, data: Record<string, unknown>) => void;
 }
 
 export const MAX_BODY_BYTES = 4096;
-/** Intentos de envío como máximo (1 reintento) ante fallos temporales del servidor de Auth. */
-export const MAX_SEND_ATTEMPTS = 2;
 
-/** Mismo texto en todos los casos: no revela si el correo tiene cuenta ni si se envió. */
+/** Mismo texto en todos los casos: no revela si el correo tiene cuenta ni si se enviará correo. */
 export const INVITATION_MESSAGE =
   'Invitación creada. Si la persona ya tiene cuenta, la verá al entrar en TuRestaurante; si no, recibirá un correo para crearla. Si no le llega, podrás reenviarla dentro de unos minutos.';
 
@@ -197,13 +201,23 @@ export function sqlErrorResponse(err: RpcError): { status: number; error: string
   }
 }
 
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Qué anotar según la respuesta de Supabase Auth a inviteUserByEmail. */
+export function classifyInviteError(error: AuthError | null): { result: FinishResult; rateLimited: boolean } {
+  if (!error) return { result: 'enviada', rateLimited: false };
+  // Confirmó su cuenta entre la reserva y el envío: la verá dentro de la app.
+  if (error.code === 'email_exists') return { result: 'no_necesario', rateLimited: false };
+  // Límite de correos de Supabase: se reintenta más tarde (con espera) y se para la recuperación.
+  if (error.status === 429 || error.code === 'over_email_send_rate_limit') return { result: 'reintentar', rateLimited: true };
+  // Fallo temporal (red o error del servidor): se reintenta más tarde.
+  if (!error.status || error.status >= 500) return { result: 'reintentar', rateLimited: false };
+  // Otro 4xx (p. ej. correo no autorizado por el SMTP de pruebas): no se reintenta.
+  return { result: 'fallida', rateLimited: false };
+}
 
 export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) => Promise<Response> {
   const { config, admin } = deps;
-  const now = deps.now ?? (() => Date.now());
-  const sleep = deps.sleep ?? defaultSleep;
   const log = deps.log ?? (() => {});
+  const sweepLimit = Math.max(1, Math.min(10, Math.floor(config.sweepLimit) || 1));
 
   function cors(origin: string | null): Record<string, string> | null {
     if (!origin || !config.allowedOrigins.includes(origin)) return null;
@@ -222,66 +236,75 @@ export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) 
     });
   }
 
-  /** Envía (o no) el correo de una invitación ya creada. Nunca lanza: el resultado no cambia la
-   *  respuesta a quien invita. */
-  async function deliver(invitationId: string): Promise<SendResult | 'sin_datos' | 'omitida'> {
-    let row: DeliveryRow | undefined;
+  /** Una entrega: reservar → enviar (o no) → anotar. Nunca lanza. */
+  async function deliverOne(invitationId: string): Promise<{ result: FinishResult | 'sin_reserva' | 'error'; rateLimited: boolean }> {
+    let row: ClaimRow | undefined;
     try {
-      const r = await admin.delivery(invitationId);
+      const r = await admin.claim(invitationId);
       if (r.error) {
-        log('entrega_sin_datos', { invitationId, code: r.error.code ?? null });
-        return 'sin_datos';
+        log('reserva_fallida', { invitationId, code: r.error.code ?? null });
+        return { result: 'error', rateLimited: false };
       }
       row = r.data?.[0];
     } catch {
-      log('entrega_sin_datos', { invitationId, code: 'excepcion' });
-      return 'sin_datos';
+      log('reserva_fallida', { invitationId, code: 'excepcion' });
+      return { result: 'error', rateLimited: false };
     }
-    if (!row || row.state !== 'pendiente') {
-      log('entrega_omitida', { invitationId, state: row?.state ?? null });
-      return 'omitida';
-    }
+    // Ya enviada, reservada por otro proceso, esperando reintento, cerrada o caducada: nada que hacer.
+    if (!row) return { result: 'sin_reserva', rateLimited: false };
 
-    let result: SendResult;
+    let outcome: { result: FinishResult; rateLimited: boolean };
     if (row.account_confirmed) {
       // Cuenta confirmada: la verá dentro de TuRestaurante (por ahora sin aviso por correo).
-      result = 'no_necesario';
+      outcome = { result: 'no_necesario', rateLimited: false };
     } else {
-      // Sin cuenta: Supabase la crea y envía la invitación. Cuenta invitada sin confirmar:
-      // Supabase vuelve a enviar el enlace (no crea otra). Si el envío falla, no crea nada.
-      result = 'fallida';
-      for (let attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
-        let error: AuthError | null;
-        try {
-          ({ error } = await admin.inviteUserByEmail(row.email, config.appUrl));
-        } catch {
-          error = { status: 0, code: 'red' };
-        }
-        if (!error) {
-          result = 'enviada';
-          break;
-        }
-        if (error.code === 'email_exists') {
-          // Confirmó su cuenta entre la consulta y el envío: la verá dentro de la app.
-          result = 'no_necesario';
-          break;
-        }
-        log('envio_fallido', { invitationId, attempt, status: error.status ?? null, code: error.code ?? null });
-        // Solo se reintenta un fallo temporal (red o error 5xx). Límite de correos (429), correo
-        // no autorizado por el SMTP (400) u otros 4xx: no, se anota como fallido.
-        const temporary = !error.status || error.status >= 500;
-        if (!temporary || attempt === MAX_SEND_ATTEMPTS) break;
-        await sleep(config.retryDelayMs);
+      // Sin cuenta: Supabase la crea y envía el enlace. Invitada sin confirmar: Supabase vuelve a
+      // enviar el enlace sin crear otra cuenta. Si el envío falla, Supabase no crea nada.
+      let error: AuthError | null;
+      try {
+        ({ error } = await admin.inviteUserByEmail(row.email, config.appUrl));
+      } catch {
+        error = { status: 0, code: 'red' };
+      }
+      outcome = classifyInviteError(error);
+      if (error && error.code !== 'email_exists') {
+        log('envio_fallido', { invitationId, attempt: row.attempt, status: error.status ?? null, code: error.code ?? null });
       }
     }
     try {
-      const m = await admin.markSent(invitationId, result);
-      if (m.error) log('anotacion_fallida', { invitationId, code: m.error.code ?? null });
+      const f = await admin.finish(invitationId, row.claim, outcome.result);
+      if (f.error) log('anotacion_fallida', { invitationId, code: f.error.code ?? null });
+      // La reserva caducó y otro proceso la retomó: su resultado manda. (Solo pasa si este proceso
+      // tardó más de 10 minutos.)
+      else if (f.data === false) log('resultado_descartado', { invitationId, attempt: row.attempt });
     } catch {
       log('anotacion_fallida', { invitationId, code: 'excepcion' });
     }
-    log('entrega', { invitationId, result });
-    return result;
+    log('entrega', { invitationId, attempt: row.attempt, result: outcome.result });
+    return outcome;
+  }
+
+  /** En segundo plano: la entrega de la invitación recién creada y la recuperación de entregas
+   *  atrasadas o interrumpidas (como mucho sweepLimit). Se para si Supabase limita los correos. */
+  async function processDeliveries(invitationId: string): Promise<void> {
+    try {
+      const first = await deliverOne(invitationId);
+      if (first.rateLimited) return;
+      let ids: string[] = [];
+      try {
+        const p = await admin.pending(sweepLimit);
+        if (p.error) log('recuperacion_fallida', { code: p.error.code ?? null });
+        ids = (p.data ?? []).filter((id) => id !== invitationId).slice(0, sweepLimit);
+      } catch {
+        log('recuperacion_fallida', { code: 'excepcion' });
+      }
+      for (const id of ids) {
+        const r = await deliverOne(id);
+        if (r.rateLimited) break;
+      }
+    } catch {
+      log('segundo_plano_fallido', { invitationId });
+    }
   }
 
   return async function handle(req: Request): Promise<Response> {
@@ -322,14 +345,8 @@ export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) 
     if (!who) return json(401, { ok: false, error: 'Tu sesión no es válida. Vuelve a iniciar sesión' }, corsHeaders);
     if (who.isAnonymous) return json(403, { ok: false, error: 'Inicia sesión con tu cuenta para invitar' }, corsHeaders);
 
-    const start = now();
-    /** Tiempo mínimo de respuesta: que no se note si hubo envío de correo o no. */
-    const settle = async () => {
-      const left = config.minResponseMs - (now() - start);
-      if (left > 0) await sleep(left);
-    };
-
-    // 1) Permisos y datos: SQL con el JWT de quien llama.
+    // 1) Permisos y datos: SQL con el JWT de quien llama. (No consulta si el correo tiene cuenta:
+    //    su duración no depende de eso.)
     let invitationId: string;
     let restaurantId: string | undefined;
     try {
@@ -355,13 +372,12 @@ export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) 
       const err = (e && typeof e === 'object' ? e : {}) as RpcError;
       const { status, error } = sqlErrorResponse(err);
       if (status === 500) log('sql_error', { action: action.action, code: err.code ?? null });
-      await settle();
       return json(status, { ok: false, error }, corsHeaders);
     }
 
-    // 2) Envío del correo (clave secreta). Su resultado NO cambia la respuesta.
-    await deliver(invitationId);
-    await settle();
+    // 2) El correo, DESPUÉS de responder. La entrega ya está guardada como pendiente en la base de
+    //    datos: si esta tarea no llega a terminar, se recupera en otra llamada.
+    deps.background(processDeliveries(invitationId));
     return json(200, { ok: true, invitationId, ...(restaurantId ? { restaurantId } : {}), message: INVITATION_MESSAGE }, corsHeaders);
   };
 }

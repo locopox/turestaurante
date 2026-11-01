@@ -151,12 +151,16 @@ existe `staff_add_member`).
 - **Integridad** (también desde el SQL Editor): el historial no se borra, sus datos no cambian, una invitación
   cerrada no se reactiva y una caducada no se acepta. Auditoría de crear, reenviar, aceptar, rechazar, revocar y
   envíos fallidos, con el **correo enmascarado** (`j***@ejemplo.com`).
-- **Solo para el servidor** (Edge Function): `invitation_delivery` (incluye si el correo ya tiene cuenta y si está
-  confirmada, datos que nunca llegan a quien invita) e `invitation_mark_sent`. Los envíos fallidos quedan en el
-  registro sin restaurante: solo los ve la plataforma (al propietario le revelarían si la persona tenía cuenta).
-- **Edge Function `invitations`**: verifica el JWT, deja que SQL decida los permisos con el JWT de quien invita y usa
-  la clave secreta solo para enviar el correo de Supabase Auth (cuenta nueva o sin confirmar) y anotar el envío. La
-  respuesta y el tiempo de respuesta son los mismos tenga o no cuenta el correo. El enlace vuelve siempre a `APP_URL`.
+- **Entrega de correos** (solo el servidor): cola persistente dentro de cada invitación. `invitation_delivery_claim`
+  reserva la entrega de forma atómica (sin duplicados; dice si el correo tiene cuenta y si está confirmada, datos que
+  nunca llegan a quien invita), `invitation_delivery_finish` anota el resultado con esa reserva e
+  `invitation_delivery_pending` devuelve las atrasadas o interrumpidas. Máximo 3 intentos con espera (5 y 30 min);
+  una reserva caduca a los 10 min. El resultado de cada entrega queda en el registro sin restaurante: solo lo ve la
+  plataforma (al propietario le revelaría si la persona tenía cuenta).
+- **Edge Function `invitations`**: verifica el JWT, deja que SQL decida los permisos con el JWT de quien invita y
+  responde en cuanto se crea la invitación. El correo se envía después, en segundo plano (`EdgeRuntime.waitUntil`),
+  con la clave secreta solo en el servidor; cada llamada recupera además hasta 5 entregas pendientes. La respuesta es
+  la misma tenga o no cuenta el correo. El enlace vuelve siempre a `APP_URL`.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
@@ -168,7 +172,7 @@ existe `staff_add_member`).
 
 ```bash
 npm test          # reglas de pedido, modo demo, permisos y variables de entorno (Vitest)
-npm run test:db         # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase)
+npm run test:db         # seguridad del SQL y entregas simultáneas: necesita un PostgreSQL LOCAL (no Supabase)
 npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada (PostgreSQL LOCAL)
 ```
 

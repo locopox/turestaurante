@@ -16,8 +16,8 @@ invitaciones. Envía el correo de invitación de Supabase Auth cuando hace falta
 |---|---|
 | Identidad | El JWT de `Authorization: Bearer …` se verifica con Supabase Auth (`auth.getUser`). Sin JWT válido: 401. Sesiones anónimas: 403. |
 | Permisos | **Todos** los decide SQL: `invitation_create`, `platform_create_restaurant` e `invitation_resend` se llaman con la **clave pública + el JWT de quien invita**, así que la base de datos aplica sus permisos (rol, restaurante, límites). La clave secreta no se usa para decidir nada. |
-| Clave secreta | Solo en el servidor (variable de la función) y solo para tres cosas: `auth.admin.inviteUserByEmail`, `invitation_delivery` e `invitation_mark_sent`. Se usa **después** de que SQL haya aceptado la invitación. |
-| No revelar cuentas | Respuesta idéntica (estado, cuerpo y cabeceras) tenga o no cuenta el correo, sea de otro restaurante o de la plataforma, y se envíe o falle el correo. Tiempo mínimo de respuesta (`MIN_RESPONSE_MS`, 1,5 s) para que no se note si hubo envío. Los envíos fallidos solo los ve la plataforma en el registro (el propietario no). |
+| Clave secreta | Solo en el servidor (variable de la función) y solo para cuatro cosas: `auth.admin.inviteUserByEmail` e `invitation_delivery_claim` / `_finish` / `_pending`. Se usa **después** de que SQL haya aceptado la invitación. |
+| No revelar cuentas | Respuesta idéntica (estado, cuerpo y cabeceras) tenga o no cuenta el correo, sea de otro restaurante o de la plataforma. Se responde en cuanto SQL crea la invitación; el correo se envía **después**, en segundo plano (`EdgeRuntime.waitUntil`), así que ni la respuesta ni su duración dependen del envío. El resultado de cada entrega solo lo ve la plataforma en el registro (`invitacion.entrega`, sin restaurante); el propietario no. |
 | Redirección | El enlace del correo vuelve siempre a `APP_URL` (secreto de la función, https; http solo en localhost; sin `?` ni `#`). Lo que mande el navegador (`redirectTo`, etc.) se ignora. Sin `APP_URL` válida la función responde 500 y no invita a nadie. |
 | Registros | Solo identificadores de invitación, resultados y códigos de error. Nunca correos, JWT ni claves. |
 | CORS | Solo los orígenes de `ALLOWED_ORIGINS` (o el de `APP_URL`). |
@@ -44,25 +44,61 @@ más de 3 veces), 500 (otros; sin detalles internos).
 
 ## Qué pasa con el correo
 
+### Entrega en segundo plano y cola persistente
+
+1. SQL crea la invitación con `send_status = 'sin_enviar'`: **la entrega pendiente ya está guardada** antes de responder.
+2. La función responde y, con `EdgeRuntime.waitUntil`, en segundo plano:
+   - **reserva** la entrega (`invitation_delivery_claim`). La reserva es atómica: si dos procesos lo intentan a la vez
+     (peticiones simultáneas, reenvíos, recuperación), solo uno la obtiene. Cuenta un intento (máximo 3);
+   - envía (o no) el correo y **anota** el resultado (`invitation_delivery_finish`) con el identificador de su reserva.
+     Un proceso que perdió la reserva no puede sobrescribir el resultado de otro;
+   - **recupera** entregas atrasadas o interrumpidas (`invitation_delivery_pending`): como mucho `SWEEP_LIMIT`
+     (5, máximo 10) por llamada, primero las interrumpidas. Se detiene si Supabase limita los correos.
+3. `waitUntil` **no garantiza** que la tarea termine (la función se detiene al agotar su tiempo o si se reinicia).
+   Por eso todo el estado está en la base de datos:
+   - interrumpida **antes** de reservar: sigue `sin_enviar`; la recuperación la toma pasados 2 minutos;
+   - interrumpida **después** de reservar: la reserva caduca a los **10 minutos** (más que el tiempo máximo de una
+     Edge Function) y la recuperación la retoma como nuevo intento;
+   - interrumpida en el 3.er intento: la recuperación la cierra como `fallida` (no queda reservada para siempre).
+
+| `send_status` | Significado |
+|---|---|
+| `sin_enviar` | Por enviar, o esperando un reintento hasta `send_next_at` |
+| `enviando` | Reservada por un proceso (`send_claim`) desde `send_claimed_at` |
+| `enviada` | Supabase Auth envió el correo |
+| `no_necesario` | La cuenta ya estaba confirmada: la verá dentro de TuRestaurante |
+| `fallida` | Fallo definitivo o 3 intentos sin éxito |
+
+### Según la cuenta
+
 Comportamiento de `inviteUserByEmail` comprobado en el código de Supabase Auth (repositorio `supabase/auth`,
 commit `a7e97d6`, `internal/api/invite.go` y `mail.go`):
 
-| Situación del correo | Qué hace la función | `send_status` |
+| Situación del correo | Qué hace la función | Resultado |
 |---|---|---|
-| Sin cuenta | `inviteUserByEmail`: Supabase crea la cuenta **sin confirmar** y envía el enlace. Si el envío falla, Supabase deshace todo (no queda cuenta). | `enviada` / `fallida` |
-| Cuenta invitada que aún no confirmó | `inviteUserByEmail` otra vez: Supabase **no crea otra cuenta** y envía un enlace nuevo (el anterior deja de valer). | `enviada` / `fallida` |
-| Cuenta confirmada (de otro restaurante, de la plataforma o sin restaurante) | No se envía nada ni se toca la cuenta (ni su contraseña). La verá dentro de TuRestaurante. | `no_necesario` |
-| Confirmó justo entre la consulta y el envío (`email_exists`) | Igual que la anterior. | `no_necesario` |
+| Sin cuenta | `inviteUserByEmail`: Supabase crea la cuenta **sin confirmar** y envía el enlace. Si el envío falla, Supabase deshace todo (no queda cuenta). | `enviada` |
+| Cuenta invitada que aún no confirmó | `inviteUserByEmail` otra vez: Supabase **no crea otra cuenta** y envía un enlace nuevo (el anterior deja de valer). | `enviada` |
+| Cuenta confirmada (de otro restaurante, de la plataforma o sin restaurante) | No se envía nada ni se toca la cuenta (ni su contraseña). | `no_necesario` |
+| Confirmó justo entre la reserva y el envío (`email_exists`) | Igual que la anterior. | `no_necesario` |
 
-Fallos de envío:
+### Fallos y reintentos
 
-- **Temporal** (red o error 5xx de Auth): un reintento tras 0,8 s. Si vuelve a fallar, `fallida`.
-- **Límite de correos de Supabase** (429 `over_email_send_rate_limit`), **correo no autorizado** por el SMTP de
-  pruebas de Supabase (400 `email_address_not_authorized`) u otro 4xx: sin reintento, `fallida`.
-- La invitación **sigue creada** aunque el correo falle; quien invita puede reenviarla pasados 5 minutos (máximo 3
-  veces). El fallo queda en el registro de auditoría **solo para la plataforma** (`invitacion.envio_fallido`).
-- El registro público sigue desactivado: en Supabase Auth, la desactivación del registro no afecta a
-  `/invite` (comprobado en el código: solo se aplica al registro público y a proveedores externos).
+| Respuesta de Supabase Auth | Resultado |
+|---|---|
+| Fallo temporal (red o 5xx) | Reintento: espera **5 min** tras el 1.er intento y **30 min** tras el 2.º. Tras el 3.º, `fallida`. |
+| Límite de correos (429 `over_email_send_rate_limit`) | Igual (reintento con espera) y la recuperación de esa llamada **se detiene**. |
+| Otro 4xx (p. ej. 400 `email_address_not_authorized` del SMTP de pruebas) | `fallida`, sin reintentos. |
+
+Límites contra el envío masivo: 3 intentos por invitación con esperas, como mucho 10 recuperaciones por llamada, y
+los límites de SQL (20 invitaciones nuevas por hora y persona, 30 pendientes por restaurante, 3 reenvíos con 5
+minutos de espera). Un reenvío crea una invitación nueva: la anterior queda «reemplazada» y ya no se envía.
+
+Duplicados: la reserva atómica impide que dos procesos envíen a la vez. El único caso posible es que el proceso se
+detenga **después** de que Supabase envíe el correo y **antes** de anotarlo: al recuperarla se enviaría otro enlace
+(el anterior deja de valer). Está acotado a 3 intentos.
+
+El registro público sigue desactivado: en Supabase Auth, la desactivación del registro no afecta a `/invite`
+(comprobado en el código: solo se aplica al registro público y a proveedores externos).
 
 ## Variables de la función
 
@@ -71,7 +107,7 @@ Fallos de envío:
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las pone Supabase en sus Edge Functions | — (no se guardan en el repositorio) |
 | `APP_URL` | Secreto de la función | Dirección de la app, p. ej. `https://turestaurante.ejemplo.com/` |
 | `ALLOWED_ORIGINS` | Opcional | Orígenes del navegador separados por comas (por defecto, el de `APP_URL`) |
-| `MIN_RESPONSE_MS` | Opcional | Tiempo mínimo de respuesta en ms (por defecto 1500) |
+| `SWEEP_LIMIT` | Opcional | Entregas atrasadas que recupera cada llamada (1-10, por defecto 5) |
 
 Plantilla sin secretos: `supabase/functions/.env.example`. Copia local: `supabase/functions/.env.local` (ignorada
 por git).
@@ -155,7 +191,11 @@ Casos a comprobar en la E4 (dos restaurantes, cuentas distintas):
   manda un enlace nuevo; el anterior deja de valer; no se crea otra cuenta.
 - **Cuenta existente confirmada** (de otro restaurante y de la plataforma): no llega correo; la respuesta es idéntica.
 - **Fallo de envío**: con el límite de correos a 0 (`[auth.rate_limit] email_sent = 0`) Supabase responde 429; la
-  invitación queda `fallida`, la respuesta no cambia y la plataforma ve `invitacion.envio_fallido`.
+  entrega queda `sin_enviar` con espera y, tras 3 intentos, `fallida`; la respuesta no cambia y la plataforma ve
+  `invitacion.entrega`.
+- **Interrupción**: detener `supabase functions serve` mientras envía; al volver, otra invitación (pasados 2 o 10
+  minutos) recupera la entrega.
+- **Segundo plano**: la respuesta llega antes que el correo.
 - **Límites** de 20/hora, 30 pendientes, 5 minutos y 3 reenvíos: 429.
 - **Permisos**: owner → owner (403), manager → manager (403), otro restaurante (403), sin sesión (401).
 - **Redirección**: un `redirectTo` en la petición no cambia el enlace del correo.
@@ -167,10 +207,17 @@ npm test                                             # incluye las pruebas de la
 deno check supabase/functions/invitations/index.ts   # si tienes Deno instalado
 ```
 
+## Recuperación sin nuevas invitaciones (pendiente de decisión)
+
+Hoy la recuperación se hace **en cada llamada a la función**. Si una entrega queda interrumpida y nadie vuelve a
+invitar a nadie, sigue pendiente hasta la siguiente invitación (o hasta que quien invitó la reenvíe). No se pierde,
+pero puede esperar. Para recuperarla sola haría falta una **tarea programada** (por ejemplo, `pg_cron` + `pg_net` de
+Supabase llamando a la función cada pocos minutos). No está hecha: ver el informe de la etapa.
+
 ## Lo que falta por comprobar (E4)
 
-- Todo lo anterior contra Supabase Auth real (local con Docker): sobre todo el reenvío a cuentas sin confirmar y la
-  vuelta del enlace con `type=invite`. El comportamiento descrito sale del código fuente de Supabase Auth; la versión
+- Todo lo anterior contra Supabase Auth real (local con Docker): sobre todo el reenvío a cuentas sin confirmar, la
+  vuelta del enlace con `type=invite` y que `EdgeRuntime.waitUntil` sigue ejecutando el envío después de responder. El comportamiento descrito sale del código fuente de Supabase Auth; la versión
   desplegada en Supabase podría diferir.
 - Con las claves nuevas de Supabase (`sb_publishable_…` / `sb_secret_…`), confirmar que la función recibe
   `SUPABASE_ANON_KEY` y `SUPABASE_SERVICE_ROLE_KEY` y que `verify_jwt` se comporta como se espera.

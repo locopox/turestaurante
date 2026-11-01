@@ -1245,8 +1245,9 @@ select tests.throws('select * from private.invitations', 'permission denied', 'p
 select tests.throws(format('insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at) values (%L, %L, %L, %L, now())',
   tests.piazza(), 'x@x.test', 'owner', 'plataforma'), 'permission denied', 'personal: no crea invitaciones directamente');
 select tests.throws(format('select private.invitation_insert(%L, %L, %L, null, 0)', tests.piazza(), 'x@x.test', 'owner'), 'permission denied', 'personal: no usa las funciones internas');
-select tests.throws(format('select * from public.invitation_delivery(%L)', gen_random_uuid()), 'permission denied', 'personal: no ve los datos de envío (si existe la cuenta)');
-select tests.throws(format('select public.invitation_mark_sent(%L, %L)', gen_random_uuid(), 'enviada'), 'permission denied', 'personal: no anota envíos');
+select tests.throws(format('select * from public.invitation_delivery_claim(%L)', gen_random_uuid()), 'permission denied', 'personal: no reserva entregas (ni ve si existe la cuenta)');
+select tests.throws(format('select public.invitation_delivery_finish(%L, %L, %L)', gen_random_uuid(), gen_random_uuid(), 'enviada'), 'permission denied', 'personal: no anota envíos');
+select tests.throws('select * from public.invitation_delivery_pending(5)', 'permission denied', 'personal: no ve las entregas pendientes');
 reset role;
 select tests.claims('service_role', null);
 set role service_role;
@@ -1604,29 +1605,122 @@ select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 insert into tests.vars select 'inv_sinconf', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'sinconfirmar@persona.test', 'waiter'));
 reset role;
+select tests.claims(null, null);
+-- Utilidades (como postgres): estado de la entrega y reserva como servidor.
+create function tests.send(iid uuid) returns text language sql security definer as $$
+  select send_status || '/' || send_attempts from private.invitations where id = iid $$;
+create function tests.next_in(iid uuid) returns interval language sql security definer as $$
+  select send_next_at - now() from private.invitations where id = iid $$;
+create function tests.claim(iid uuid) returns jsonb language sql as $$
+  select to_jsonb(c) from public.invitation_delivery_claim(iid) c $$;
+create function tests.cl(k text) returns uuid language sql stable as $$ select (val ->> 'claim')::uuid from tests.vars where key = k $$;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'inv_fresca', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'fresca@persona.test', 'waiter'));
+insert into tests.vars select 'inv_agotada', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'agotada@persona.test', 'waiter'));
+reset role;
 select tests.claims('service_role', null);
 set role service_role;
-select tests.ok((select not account_exists and state = 'pendiente' and email = 'fantasma@x.test' from public.invitation_delivery(tests.id('r_sin'))),
-  'servidor: sabe que el correo no tiene cuenta (para crearla)');
-select tests.ok((select account_exists and account_confirmed from public.invitation_delivery(tests.id('r_con'))), 'servidor: sabe que el correo ya tiene cuenta confirmada (la verá en la app)');
-select tests.ok((select not account_confirmed from public.invitation_delivery(tests.id('r_sin'))), 'servidor: sin cuenta no hay cuenta confirmada');
-select tests.ok((select account_exists and not account_confirmed from public.invitation_delivery(tests.id('inv_sinconf'))),
+-- Envío correcto y duplicados
+insert into tests.vars select 'c_sin', tests.claim(tests.id('r_sin'));
+select tests.ok(tests.v('c_sin') ->> 'email' = 'fantasma@x.test' and not (tests.v('c_sin') ->> 'account_exists')::boolean
+  and not (tests.v('c_sin') ->> 'account_confirmed')::boolean and (tests.v('c_sin') ->> 'attempt')::int = 1,
+  'servidor: reserva la entrega y sabe que el correo no tiene cuenta (para crearla)');
+select tests.ok(tests.claim(tests.id('r_sin')) is null, 'duplicados: una entrega reservada no se puede reservar otra vez');
+select tests.ok(not public.invitation_delivery_finish(tests.id('r_sin'), gen_random_uuid(), 'enviada'), 'duplicados: sin la reserva vigente no se anota nada');
+select tests.ok(public.invitation_delivery_finish(tests.id('r_sin'), tests.cl('c_sin'), 'enviada'), 'envío correcto: se anota con su reserva');
+select tests.ok(not public.invitation_delivery_finish(tests.id('r_sin'), tests.cl('c_sin'), 'fallida'), 'duplicados: la misma reserva no se anota dos veces');
+select tests.ok(tests.claim(tests.id('r_sin')) is null, 'duplicados: una invitación ya enviada no se vuelve a enviar');
+select tests.ok(tests.send(tests.id('r_sin')) = 'enviada/1', 'envío correcto: queda «enviada» tras 1 intento');
+-- Cuenta confirmada: no hace falta correo
+insert into tests.vars select 'c_con', tests.claim(tests.id('r_con'));
+select tests.ok((tests.v('c_con') ->> 'account_exists')::boolean and (tests.v('c_con') ->> 'account_confirmed')::boolean,
+  'servidor: sabe que el correo ya tiene cuenta confirmada (la verá en la app)');
+select public.invitation_delivery_finish(tests.id('r_con'), tests.cl('c_con'), 'no_necesario');
+select tests.ok(tests.send(tests.id('r_con')) = 'no_necesario/1', 'cuenta confirmada: queda «no_necesario»');
+-- Cuenta invitada sin confirmar + interrupción del proceso
+insert into tests.vars select 'c_sc1', tests.claim(tests.id('inv_sinconf'));
+select tests.ok((tests.v('c_sc1') ->> 'account_exists')::boolean and not (tests.v('c_sc1') ->> 'account_confirmed')::boolean,
   'servidor: distingue una cuenta invitada que aún no ha confirmado su correo (hay que reenviarle el enlace)');
-select public.invitation_mark_sent(tests.id('r_sin'), 'enviada');
-select public.invitation_mark_sent(tests.id('r_con'), 'no_necesario');
-select public.invitation_mark_sent(tests.id('r_sin'), 'fallida');
-select tests.throws(format('select public.invitation_mark_sent(%L, %L)', tests.id('inv_rev'), 'enviada'), 'no está pendiente', 'servidor: no anota envíos de invitaciones cerradas');
-select tests.throws(format('select public.invitation_mark_sent(%L, %L)', tests.id('r_sin'), 'leida'), 'no válido', 'servidor: solo resultados de envío conocidos');
+select tests.ok(tests.claim(tests.id('inv_sinconf')) is null, 'interrupción: mientras la reserva está vigente (10 min) nadie la retoma');
+select tests.ok(not exists (select 1 from public.invitation_delivery_pending(10) p where p = tests.id('inv_sinconf')), 'interrupción: una reserva vigente no aparece para recuperar');
 reset role;
 select tests.claims(null, null);
-select tests.ok((select send_status = 'fallida' and last_sent_at is not null from private.invitations where id = tests.id('r_sin'))
-  and (select send_status = 'no_necesario' from private.invitations where id = tests.id('r_con')), 'servidor: el resultado del envío queda anotado');
-select tests.throws(format('select * from public.invitation_delivery(%L)', tests.id('r_sin')), 'Solo el servidor', 'SQL Editor sin rol de servidor: la comprobación interna también protege');
+update private.invitations set send_claimed_at = now() - interval '11 minutes' where id = tests.id('inv_sinconf');  -- el proceso murió
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(exists (select 1 from public.invitation_delivery_pending(10) p where p = tests.id('inv_sinconf')), 'interrupción: la reserva caducada aparece para recuperar');
+insert into tests.vars select 'c_sc2', tests.claim(tests.id('inv_sinconf'));
+select tests.ok((tests.v('c_sc2') ->> 'attempt')::int = 2, 'interrupción: se retoma como 2.º intento');
+select tests.ok(not public.invitation_delivery_finish(tests.id('inv_sinconf'), tests.cl('c_sc1'), 'enviada'), 'interrupción: el proceso interrumpido ya no puede anotar su resultado');
+select tests.ok(public.invitation_delivery_finish(tests.id('inv_sinconf'), tests.cl('c_sc2'), 'reintentar'), 'reintento: se anota un fallo temporal');
+select tests.ok(tests.send(tests.id('inv_sinconf')) = 'sin_enviar/2' and tests.next_in(tests.id('inv_sinconf')) between interval '29 minutes' and interval '30 minutes',
+  'reintento: tras el 2.º intento espera 30 minutos');
+select tests.ok(tests.claim(tests.id('inv_sinconf')) is null, 'reintento: no se reenvía antes de la espera');
+select tests.ok(not exists (select 1 from public.invitation_delivery_pending(10) p where p = tests.id('inv_sinconf')), 'reintento: no aparece para recuperar antes de la espera');
+reset role;
+select tests.claims(null, null);
+update private.invitations set send_next_at = now() - interval '1 second' where id = tests.id('inv_sinconf');
+select tests.claims('service_role', null);
+set role service_role;
+insert into tests.vars select 'c_sc3', tests.claim(tests.id('inv_sinconf'));
+select public.invitation_delivery_finish(tests.id('inv_sinconf'), tests.cl('c_sc3'), 'reintentar');
+select tests.ok(tests.send(tests.id('inv_sinconf')) = 'fallida/3', 'reintento: tras 3 intentos queda «fallida» (sin envíos en masa)');
+select tests.ok(tests.claim(tests.id('inv_sinconf')) is null, 'reintento: una entrega fallida no se vuelve a intentar sola');
+-- Primer reintento: 5 minutos
+insert into tests.vars select 'c_re', tests.claim(tests.id('inv_re'));
+select public.invitation_delivery_finish(tests.id('inv_re'), tests.cl('c_re'), 'reintentar');
+select tests.ok(tests.send(tests.id('inv_re')) = 'sin_enviar/1' and tests.next_in(tests.id('inv_re')) between interval '4 minutes 59 seconds' and interval '5 minutes',
+  'reintento: tras el 1.er intento espera 5 minutos');
+-- Fallo definitivo
+insert into tests.vars select 'c_casi', tests.claim(tests.id('inv_casi'));
+select public.invitation_delivery_finish(tests.id('inv_casi'), tests.cl('c_casi'), 'fallida');
+select tests.ok(tests.send(tests.id('inv_casi')) = 'fallida/1' and tests.claim(tests.id('inv_casi')) is null, 'fallo definitivo: queda «fallida» y no se reintenta');
+select tests.throws(format('select public.invitation_delivery_finish(%L, %L, %L)', tests.id('inv_casi'), gen_random_uuid(), 'leida'), 'no válido', 'servidor: solo resultados conocidos');
+-- Invitaciones cerradas, reemplazadas o caducadas no se envían
+select tests.ok(tests.claim(tests.id('inv_rev')) is null and tests.claim(tests.id('inv_cad')) is null and tests.claim(tests.id('inv_cad3')) is null,
+  'no se envían invitaciones revocadas, reemplazadas ni caducadas');
+-- Recién creada: la envía su propio proceso; la recuperación no la toca hasta pasados 2 minutos
+select tests.ok(not exists (select 1 from public.invitation_delivery_pending(10) p where p = tests.id('inv_fresca')), 'recuperación: no toca una invitación recién creada');
+select tests.ok((select count(*) from public.invitation_delivery_pending(1000)) <= 10 and (select count(*) from public.invitation_delivery_pending(1)) = 1,
+  'recuperación: como mucho 10 entregas por llamada');
+-- Una entrega en curso se cierra aunque la invitación se revoque mientras tanto
+insert into tests.vars select 'c_fresca', tests.claim(tests.id('inv_fresca'));
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select public.invitation_revoke(tests.id('inv_fresca'));
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(public.invitation_delivery_finish(tests.id('inv_fresca'), tests.cl('c_fresca'), 'enviada'), 'una entrega en curso se puede cerrar aunque la invitación se revoque');
+-- Reserva interrumpida en el último intento: la recuperación la cierra como «fallida»
+reset role;
+select tests.claims(null, null);
+update private.invitations set send_attempts = 2 where id = tests.id('inv_agotada');
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok((tests.claim(tests.id('inv_agotada')) ->> 'attempt')::int = 3, 'último intento reservado');
+reset role;
+select tests.claims(null, null);
+update private.invitations set send_claimed_at = now() - interval '11 minutes' where id = tests.id('inv_agotada');
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok(not exists (select 1 from public.invitation_delivery_pending(10) p where p = tests.id('inv_agotada'))
+  and tests.send(tests.id('inv_agotada')) = 'fallida/3', 'interrupción en el último intento: queda «fallida», no se queda reservada para siempre');
+reset role;
+select tests.claims(null, null);
+-- Integridad de la entrega (también desde el SQL Editor)
+select tests.throws(format('update private.invitations set send_status = %L where id = %L', 'sin_enviar', tests.id('r_sin')), 'no se puede cambiar', 'SQL Editor: un envío hecho no se vuelve a poner por enviar');
+select tests.throws(format('update private.invitations set send_attempts = 0 where id = %L', tests.id('inv_re')), 'no se pueden reducir', 'SQL Editor: no se reinician los intentos');
+select tests.throws(format($$insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at, send_status, send_claim, send_claimed_at)
+  values (%L, 'reservada@x.test', 'waiter', 'personal', now() + interval '168 hours', 'enviando', gen_random_uuid(), now())$$, tests.piazza()), 'empieza pendiente', 'SQL Editor: una invitación no nace reservada');
+select tests.throws('select * from public.invitation_delivery_pending(1)', 'Solo el servidor', 'SQL Editor sin rol de servidor: la comprobación interna también protege');
 
 -- 15.15 Auditoría (correo enmascarado)
 select tests.ok(tests.logged(tests.piazza(), 'invitacion.creada') and tests.logged(tests.piazza(), 'invitacion.reenviada')
   and tests.logged(tests.piazza(), 'invitacion.aceptada') and tests.logged(tests.piazza(), 'invitacion.rechazada')
-  and tests.logged(tests.piazza(), 'invitacion.revocada') and tests.logged(null, 'invitacion.envio_fallido')
+  and tests.logged(tests.piazza(), 'invitacion.revocada') and tests.logged(null, 'invitacion.entrega')
   and tests.logged(tests.tercero(), 'plataforma.consulta_invitaciones'), 'auditoría: crear, reenviar, aceptar, rechazar, revocar, envío fallido y consultas de la plataforma');
 select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'invitador_sin_permiso')
   and exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'manual'), 'auditoría: el motivo de cada revocación');
@@ -1641,11 +1735,12 @@ select tests.ok(not exists (select 1 from private.audit_log where details::text 
 select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 select tests.ok(exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.creada'), 'owner: ve las invitaciones en su registro');
-select tests.ok(not exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.envio_fallido'),
-  'owner: no ve los envíos fallidos (revelarían si el correo tenía cuenta)');
+select tests.ok(not exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.entrega'),
+  'owner: no ve las entregas ni sus resultados (revelarían si el correo tenía cuenta)');
 select tests.claims('authenticated', tests.u('ad'));
-select tests.ok(exists (select 1 from public.audit_list(null, 500) where action = 'invitacion.envio_fallido' and details ->> 'restaurante' = tests.piazza()::text),
-  'plataforma: ve los envíos fallidos y de qué restaurante son');
+select tests.ok((select count(distinct details ->> 'resultado') from public.audit_list(null, 500) where action = 'invitacion.entrega'
+  and details ->> 'restaurante' = tests.piazza()::text and details ->> 'resultado' in ('enviada', 'no_necesario', 'reintento', 'fallida')) = 4,
+  'plataforma: ve cada intento de entrega (enviada, no necesaria, reintento, fallida) y de qué restaurante es');
 reset role;
 
 -- 15.16 El SQL Editor sigue pudiendo crear restaurantes abiertos (por ejemplo seed.sql)

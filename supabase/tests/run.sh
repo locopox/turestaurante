@@ -21,3 +21,8 @@ $P -f schema.sql   # se ejecuta dos veces: debe ser repetible
 $P -f seed.sql
 $P -f seed.sql                 # dos veces: no debe duplicar datos
 $P -f tests/security_test.sql
+# Entregas de invitaciones con procesos simultáneos (sesiones en paralelo), en otra base desechable
+psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists ${DB}_paralelo" -c "create database ${DB}_paralelo"
+psql -v ON_ERROR_STOP=1 -q -d ${DB}_paralelo -f tests/supabase_shim.sql -f schema.sql -f seed.sql
+bash tests/delivery_concurrency_test.sh ${DB}_paralelo
+psql -q -d postgres -c "drop database ${DB}_paralelo"

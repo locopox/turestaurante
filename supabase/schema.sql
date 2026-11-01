@@ -153,10 +153,21 @@ create table if not exists private.invitations (
   -- Reenvío: la nueva invitación sustituye a la anterior (que pasa a «reemplazada»).
   replaces uuid references private.invitations on delete restrict,
   resend_count int not null default 0 check (resend_count between 0 and 3),
-  -- Lo anota el servidor (Edge Function) al enviar el correo. «no_necesario»: la persona ya
-  -- tiene cuenta y la verá dentro de TuRestaurante.
-  send_status text not null default 'sin_enviar' check (send_status in ('sin_enviar', 'enviada', 'fallida', 'no_necesario')),
+  -- Entrega del correo (la hace la Edge Function en segundo plano). Es una cola PERSISTENTE dentro
+  -- de la propia invitación: si la función se interrumpe, la entrega sigue pendiente y se recupera.
+  --   sin_enviar: por enviar (o esperando un reintento hasta send_next_at)
+  --   enviando:   reservada por un proceso (send_claim) desde send_claimed_at; si no termina en
+  --               10 minutos, la reserva caduca y otro proceso puede retomarla
+  --   enviada / no_necesario (cuenta confirmada: la verá en la app) / fallida: definitivos
+  -- Como mucho 3 intentos por invitación.
+  send_status text not null default 'sin_enviar'
+    check (send_status in ('sin_enviar', 'enviando', 'enviada', 'fallida', 'no_necesario')),
+  send_attempts int not null default 0 check (send_attempts between 0 and 3),
+  send_claim uuid,
+  send_claimed_at timestamptz,
+  send_next_at timestamptz,
   last_sent_at timestamptz,
+  constraint invitations_send_claim check ((send_status = 'enviando') = (send_claim is not null and send_claimed_at is not null)),
   constraint invitations_seven_days check (expires_at = created_at + interval '168 hours'),
   constraint invitations_resend check ((replaces is null) = (resend_count = 0)),
   constraint invitations_closed check ((status = 'pendiente') = (decided_at is null)),
@@ -167,6 +178,8 @@ create unique index if not exists invitations_one_pending on private.invitations
 create index if not exists invitations_restaurant_idx on private.invitations (restaurant_id, created_at desc);
 create index if not exists invitations_email_idx on private.invitations (email) where status = 'pendiente';
 create index if not exists invitations_inviter_idx on private.invitations (invited_by, created_at);
+create index if not exists invitations_delivery_idx on private.invitations (created_at)
+  where send_status in ('sin_enviar', 'enviando');
 -- <<< fase6
 
 -- Numeración de pedidos por restaurante (privada: no revela el volumen de pedidos).
@@ -2094,45 +2107,95 @@ begin
   return jsonb_build_object('restaurantId', v_rid, 'invitationId', v_inv);
 end $$;
 
--- ---------- Solo para el servidor (Edge Function con la clave secreta) ----------
--- Datos para enviar el correo. «account_exists» y «account_confirmed» solo los ve el servidor:
--- sin cuenta o sin confirmar, la Edge Function envía la invitación de Supabase Auth (que crea la
--- cuenta o reenvía el enlace); confirmada, la persona la verá dentro de la app. Nunca llegan a
--- quien invita.
+-- ---------- Entrega de correos: solo para el servidor (Edge Function con la clave secreta) ----------
+-- Ciclo: invitation_delivery_claim (reserva) → envío → invitation_delivery_finish (resultado).
+-- invitation_delivery_pending devuelve las entregas atrasadas o interrumpidas para recuperarlas.
+-- «account_exists» y «account_confirmed» solo los ve el servidor; nunca llegan a quien invita.
 drop function if exists public.invitation_delivery(uuid);
-create or replace function public.invitation_delivery(p_invitation_id uuid)
-returns table (email text, role public.staff_role, restaurant_name text, expires_at timestamptz,
-  account_exists boolean, account_confirmed boolean, state text)
-language plpgsql stable security definer set search_path = '' as $$
-#variable_conflict use_column
+drop function if exists public.invitation_mark_sent(uuid, text);
+
+create or replace function private.require_service_role(p_what text) returns void
+language plpgsql stable set search_path = '' as $$
 begin
   if coalesce(private.request_role(), '') <> 'service_role' then
-    raise exception 'Solo el servidor puede preparar el envío de invitaciones' using errcode = '42501';
+    raise exception 'Solo el servidor puede %', p_what using errcode = '42501';
+  end if;
+end $$;
+
+-- Reserva la entrega de UNA invitación. Es atómica: si dos procesos lo intentan a la vez (peticiones
+-- simultáneas, reintentos o recuperación), solo uno la obtiene; el otro no recibe nada. Se puede
+-- reservar si está pendiente y sin caducar, quedan intentos y: está por enviar (y ya pasó la espera
+-- del reintento) o su reserva anterior caducó (el proceso se interrumpió).
+create or replace function public.invitation_delivery_claim(p_invitation_id uuid)
+returns table (claim uuid, attempt int, email text, role public.staff_role, restaurant_name text,
+  account_exists boolean, account_confirmed boolean)
+language plpgsql security definer set search_path = '' as $$
+#variable_conflict use_column
+declare
+  v_claim uuid := gen_random_uuid();
+begin
+  perform private.require_service_role('enviar invitaciones');
+  update private.invitations i
+  set send_status = 'enviando', send_claim = v_claim, send_claimed_at = now(), send_attempts = i.send_attempts + 1
+  where i.id = p_invitation_id and i.status = 'pendiente' and i.expires_at > now() and i.send_attempts < 3
+    and ((i.send_status = 'sin_enviar' and (i.send_next_at is null or i.send_next_at <= now()))
+         or (i.send_status = 'enviando' and i.send_claimed_at <= now() - interval '10 minutes'));
+  if not found then
+    return;
   end if;
   return query
-    select i.email, i.role, r.name, i.expires_at,
+    select v_claim, i.send_attempts, i.email, i.role, r.name,
       exists (select 1 from auth.users u where lower(u.email::text) = i.email),
-      exists (select 1 from auth.users u where lower(u.email::text) = i.email and u.email_confirmed_at is not null),
-      private.invitation_state(i.status, i.expires_at)
+      exists (select 1 from auth.users u where lower(u.email::text) = i.email and u.email_confirmed_at is not null)
     from private.invitations i join public.restaurants r on r.id = i.restaurant_id
     where i.id = p_invitation_id;
 end $$;
 
-create or replace function public.invitation_mark_sent(p_invitation_id uuid, p_result text) returns void
-language plpgsql security definer set search_path = '' as $$
+-- Anota el resultado. Solo vale con la reserva vigente (p_claim): un proceso que perdió su reserva
+-- no puede sobrescribir el resultado de otro. «reintentar»: vuelve a «sin_enviar» con espera
+-- (5 min tras el 1.er intento, 30 min tras el 2.º); tras el 3.º, «fallida».
+create or replace function public.invitation_delivery_finish(p_invitation_id uuid, p_claim uuid, p_result text)
+returns boolean language plpgsql security definer set search_path = '' as $$
 begin
-  if coalesce(private.request_role(), '') <> 'service_role' then
-    raise exception 'Solo el servidor puede anotar el envío de invitaciones' using errcode = '42501';
-  end if;
-  if p_result is null or p_result not in ('enviada', 'fallida', 'no_necesario') then
+  perform private.require_service_role('anotar envíos de invitaciones');
+  if p_result is null or p_result not in ('enviada', 'no_necesario', 'reintentar', 'fallida') then
     raise exception 'Resultado de envío no válido' using errcode = '22023';
   end if;
-  update private.invitations
-  set send_status = p_result, last_sent_at = case when p_result = 'enviada' then now() else last_sent_at end
-  where id = p_invitation_id and status = 'pendiente' and expires_at > now();
-  if not found then
-    raise exception 'La invitación no está pendiente' using errcode = '22023';
-  end if;
+  update private.invitations i
+  set send_status = case
+        when p_result <> 'reintentar' then p_result
+        when i.send_attempts >= 3 or i.status <> 'pendiente' then 'fallida'
+        else 'sin_enviar' end,
+      send_next_at = case
+        when p_result = 'reintentar' and i.send_attempts < 3
+          then now() + case i.send_attempts when 1 then interval '5 minutes' else interval '30 minutes' end
+        else i.send_next_at end,
+      last_sent_at = case when p_result = 'enviada' then now() else i.last_sent_at end,
+      send_claim = null, send_claimed_at = null
+  where i.id = p_invitation_id and i.send_status = 'enviando' and i.send_claim = p_claim;
+  return found;
+end $$;
+
+-- Entregas para recuperar (como mucho 10 por llamada, para no enviar correos en masa): por enviar
+-- desde hace más de 2 minutos (su proceso original no llegó a reservarla) o con la espera del
+-- reintento cumplida, y reservas caducadas (proceso interrumpido). Antes cierra como «fallida» las
+-- reservas caducadas que ya no se pueden retomar (sin intentos, cerrada o caducada).
+create or replace function public.invitation_delivery_pending(p_limit int default 5)
+returns setof uuid language plpgsql security definer set search_path = '' as $$
+begin
+  perform private.require_service_role('recuperar envíos de invitaciones');
+  update private.invitations i
+  set send_status = 'fallida', send_claim = null, send_claimed_at = null
+  where i.send_status = 'enviando' and i.send_claimed_at <= now() - interval '10 minutes'
+    and (i.send_attempts >= 3 or i.status <> 'pendiente' or i.expires_at <= now());
+  return query
+    select i.id from private.invitations i
+    where i.status = 'pendiente' and i.expires_at > now() and i.send_attempts < 3
+      and ((i.send_status = 'sin_enviar' and coalesce(i.send_next_at, i.created_at + interval '2 minutes') <= now())
+           or (i.send_status = 'enviando' and i.send_claimed_at <= now() - interval '10 minutes'))
+    -- Primero las interrumpidas; después, por antigüedad (las que más esperan).
+    order by (i.send_status = 'enviando') desc, coalesce(i.send_next_at, i.created_at)
+    limit greatest(1, least(coalesce(p_limit, 5), 10));
 end $$;
 
 -- ---------- Triggers de las invitaciones ----------
@@ -2147,7 +2210,8 @@ begin
   end if;
   if tg_op = 'INSERT' then
     if new.status <> 'pendiente' or new.decided_at is not null or new.decided_by is not null
-       or new.closed_reason is not null or new.send_status <> 'sin_enviar' or new.last_sent_at is not null then
+       or new.closed_reason is not null or new.send_status <> 'sin_enviar' or new.last_sent_at is not null
+       or new.send_attempts <> 0 or new.send_claim is not null or new.send_claimed_at is not null or new.send_next_at is not null then
       raise exception 'Una invitación siempre empieza pendiente' using errcode = '42501';
     end if;
     if new.created_at > now() then
@@ -2173,9 +2237,19 @@ begin
         or (new.decided_by is distinct from old.decided_by and new.decided_by is not null) then
     raise exception 'Los datos de una invitación no se pueden modificar' using errcode = '42501';
   end if;
-  if (new.send_status, new.last_sent_at) is distinct from (old.send_status, old.last_sent_at)
-     and old.status <> 'pendiente' then
-    raise exception 'Solo se puede anotar el envío de una invitación pendiente' using errcode = '42501';
+  if (new.send_status, new.send_attempts, new.send_claim, new.send_claimed_at, new.send_next_at, new.last_sent_at)
+     is distinct from (old.send_status, old.send_attempts, old.send_claim, old.send_claimed_at, old.send_next_at, old.last_sent_at) then
+    -- Solo una invitación pendiente se reserva; una reserva en curso se puede cerrar aunque la
+    -- invitación se haya cerrado mientras tanto. Un resultado definitivo no cambia.
+    if old.status <> 'pendiente' and old.send_status <> 'enviando' then
+      raise exception 'Solo se puede anotar el envío de una invitación pendiente' using errcode = '42501';
+    end if;
+    if old.send_status in ('enviada', 'no_necesario', 'fallida') then
+      raise exception 'El resultado de un envío no se puede cambiar' using errcode = '42501';
+    end if;
+    if new.send_attempts < old.send_attempts then
+      raise exception 'Los intentos de envío no se pueden reducir' using errcode = '42501';
+    end if;
   end if;
   return new;
 end $$;
@@ -2193,11 +2267,13 @@ begin
   elsif new.status is distinct from old.status and new.status <> 'reemplazada' then
     perform private.audit_insert(new.restaurant_id, 'invitacion.' || new.status, 'invitations', new.id::text,
       v_details || jsonb_strip_nulls(jsonb_build_object('motivo', new.closed_reason)));
-  elsif new.send_status = 'fallida' and old.send_status is distinct from 'fallida' then
-    -- Sin restaurante: solo lo ve la plataforma. Un envío solo falla si el correo no tenía cuenta
-    -- confirmada, así que el propietario no debe verlo (revelaría si la persona tiene cuenta).
-    perform private.audit_insert(null, 'invitacion.envio_fallido', 'invitations', new.id::text,
-      v_details || jsonb_build_object('restaurante', new.restaurant_id));
+  elsif old.send_status = 'enviando' and new.send_status <> 'enviando' then
+    -- Resultado de cada intento de entrega. SIN restaurante: solo lo ve la plataforma. Que se envíe
+    -- o no un correo depende de si la persona ya tenía cuenta confirmada, así que el propietario no
+    -- debe verlo.
+    perform private.audit_insert(null, 'invitacion.entrega', 'invitations', new.id::text,
+      v_details || jsonb_build_object('restaurante', new.restaurant_id, 'intento', new.send_attempts,
+        'resultado', case new.send_status when 'sin_enviar' then 'reintento' else new.send_status end));
   end if;
   return null;
 end $$;
@@ -2343,19 +2419,21 @@ revoke all on function private.normalize_email(text), private.mask_email(text),
   private.invitation_inviter_ok(uuid, uuid, text, public.staff_role), private.my_confirmed_email(),
   private.invitation_insert(uuid, text, public.staff_role, uuid, int), private.guard_invitations(),
   private.audit_invitation_changes(), private.invitations_on_staff_change(), private.invitations_on_platform_removal(),
-  private.guard_restaurant_activation()
+  private.guard_restaurant_activation(), private.require_service_role(text)
   from public, anon, authenticated, service_role;
 revoke all on function public.invitation_create(uuid, text, public.staff_role), public.invitation_resend(uuid),
   public.invitation_revoke(uuid), public.invitation_list(uuid), public.my_invitations(), public.invitation_accept(uuid),
   public.invitation_decline(uuid), public.platform_create_restaurant(text, text, text),
-  public.invitation_delivery(uuid), public.invitation_mark_sent(uuid, text)
+  public.invitation_delivery_claim(uuid), public.invitation_delivery_finish(uuid, uuid, text),
+  public.invitation_delivery_pending(int)
   from public, anon, authenticated, service_role;
 -- Personal y plataforma (cada función comprueba dentro quién llama y qué puede hacer).
 grant execute on function public.invitation_create(uuid, text, public.staff_role), public.invitation_resend(uuid),
   public.invitation_revoke(uuid), public.invitation_list(uuid), public.my_invitations(), public.invitation_accept(uuid),
   public.invitation_decline(uuid), public.platform_create_restaurant(text, text, text) to authenticated;
 -- Solo el servidor (Edge Function de envío de correos).
-grant execute on function public.invitation_delivery(uuid), public.invitation_mark_sent(uuid, text) to service_role;
+grant execute on function public.invitation_delivery_claim(uuid), public.invitation_delivery_finish(uuid, uuid, text),
+  public.invitation_delivery_pending(int) to service_role;
 -- <<< fase6
 
 -- ---------- Permisos sobre tablas + RLS ----------

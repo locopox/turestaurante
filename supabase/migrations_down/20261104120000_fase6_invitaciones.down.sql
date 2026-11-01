@@ -23,6 +23,9 @@ drop function if exists public.my_invitations();
 drop function if exists public.invitation_accept(uuid);
 drop function if exists public.invitation_decline(uuid);
 drop function if exists public.platform_create_restaurant(text, text, text);
+drop function if exists public.invitation_delivery_claim(uuid);
+drop function if exists public.invitation_delivery_finish(uuid, uuid, text);
+drop function if exists public.invitation_delivery_pending(int);
 drop function if exists public.invitation_delivery(uuid);
 drop function if exists public.invitation_mark_sent(uuid, text);
 drop table if exists private.invitations;
@@ -38,6 +41,7 @@ drop function if exists private.role_can_invite(public.staff_role, public.staff_
 drop function if exists private.my_confirmed_email();
 drop function if exists private.mask_email(text);
 drop function if exists private.normalize_email(text);
+drop function if exists private.require_service_role(text);
 
 -- 2) Restaurar el esquema de la fase 5 (copia literal de supabase/schema.sql en 55c6837, sin su
 --    begin/commit; es repetible y no borra datos). Vuelve a crear staff_add_member y sus permisos.
