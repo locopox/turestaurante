@@ -1,7 +1,7 @@
 import { createSeed, type SeedDB } from '../../data/seed';
 import { canChangePrep, OrderRuleError, validateOrder } from '../../lib/orderRules';
 import { safeStorage, uid } from '../../lib/storage';
-import type { Order, PaymentStatus, StaffSession } from '../../types';
+import type { KitchenTicket, Order, PaymentStatus, Restaurant, StaffSession } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 const KEY = 'turestaurante:demo-db:v1';
@@ -12,10 +12,18 @@ const CHANNEL = 'turestaurante:demo';
 /** Tokens de seguimiento de los clientes (token → id de pedido). Los datos antiguos no lo tienen. */
 type MockDB = SeedDB & { access?: Record<string, string> };
 
-/** En la demo no hay inicio de sesión: se actúa como administrador de la plataforma. */
-const DEMO_SESSION: StaffSession = {
-  userId: 'demo', email: 'demo@turestaurante.app', isPlatformAdmin: true, memberships: [],
-};
+/**
+ * En la demo no hay inicio de sesión. La sesión de demostración es plataforma y, además, owner
+ * de todos los restaurantes, para poder enseñar todas las pantallas. (Con Supabase, una cuenta
+ * de plataforma NO puede ser personal de ningún restaurante.)
+ */
+const demoSession = (restaurants: { id: string }[]): StaffSession => ({
+  userId: 'demo', email: 'demo@turestaurante.app', isPlatformAdmin: true,
+  memberships: restaurants.map((r) => ({ restaurantId: r.id, role: 'owner' })),
+});
+const NO_ACCOUNTS = 'En el modo demo no hay cuentas de personal: el equipo se gestiona con Supabase.';
+/** Restaurantes guardados por versiones anteriores de la demo no tienen «suspended». */
+const normalize = (r: Restaurant): Restaurant => ({ ...r, suspended: r.suspended ?? false });
 
 /**
  * Implementación en el navegador con datos ficticios.
@@ -76,10 +84,10 @@ export class MockDataService implements DataService {
 
   // Sesión
   async getSession() {
-    return DEMO_SESSION;
+    return demoSession(this.db.restaurants);
   }
   async signIn() {
-    return DEMO_SESSION;
+    return demoSession(this.db.restaurants);
   }
   async signOut() {}
   onAuthChange() {
@@ -107,17 +115,18 @@ export class MockDataService implements DataService {
 
   // Restaurantes
   async listRestaurants() {
-    return this.delay([...this.db.restaurants].sort((a, b) => a.name.localeCompare(b.name, 'es')));
+    return this.delay(this.db.restaurants.map(normalize).sort((a, b) => a.name.localeCompare(b.name, 'es')));
   }
   async getRestaurantBySlug(slug: string) {
-    return this.delay(this.db.restaurants.find((r) => r.slug === slug) ?? null);
+    const r = this.db.restaurants.find((x) => x.slug === slug);
+    return this.delay(r ? normalize(r) : null);
   }
   async createRestaurant(input: Parameters<DataService['createRestaurant']>[0]) {
     if (this.db.restaurants.some((r) => r.slug === input.slug)) throw new Error('Ya existe un restaurante con esa dirección web (slug).');
     const r = {
       tagline: '', address: '', phone: '', active: false, tables: 10, pickupEnabled: true,
       onlinePaymentEnabled: true, counterPaymentEnabled: true, prepMinutes: 15,
-      ...input, id: uid('r-'), createdAt: new Date().toISOString(),
+      ...input, id: uid('r-'), createdAt: new Date().toISOString(), suspended: false,
     };
     this.db.restaurants.push(r);
     this.db.counters[r.id] = 100;
@@ -127,9 +136,12 @@ export class MockDataService implements DataService {
   async saveRestaurant(restaurant: Parameters<DataService['saveRestaurant']>[0]) {
     if (this.db.restaurants.some((r) => r.slug === restaurant.slug && r.id !== restaurant.id))
       throw new Error('Ya existe un restaurante con esa dirección web (slug).');
-    this.db.restaurants = this.db.restaurants.map((r) => (r.id === restaurant.id ? restaurant : r));
+    // La suspensión no se cambia desde el formulario (solo con setRestaurantSuspension).
+    const current = this.db.restaurants.find((r) => r.id === restaurant.id);
+    const saved = { ...restaurant, suspended: current?.suspended ?? false };
+    this.db.restaurants = this.db.restaurants.map((r) => (r.id === restaurant.id ? saved : r));
     this.commit();
-    return this.delay(restaurant);
+    return this.delay(saved);
   }
 
   // Carta
@@ -265,6 +277,46 @@ export class MockDataService implements DataService {
   subscribeCatalog(onChange: () => void) {
     this.listeners.add(onChange);
     return () => void this.listeners.delete(onChange);
+  }
+
+  // Cocina: mismas reglas que kitchen_orders (sin teléfono, importes ni pago)
+  async listKitchenOrders(restaurantId: string): Promise<KitchenTicket[]> {
+    const tickets = this.db.orders
+      .filter((o) => o.restaurantId === restaurantId && ['nuevo', 'en_preparacion', 'listo'].includes(o.prepStatus)
+        && o.paymentStatus !== 'pendiente_online' && o.paymentStatus !== 'fallido')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((o) => ({
+        id: o.id, number: o.number, createdAt: o.createdAt, mode: o.mode, table: o.table,
+        customerName: o.mode === 'recoger' ? o.customerName : null, pickupTime: o.pickupTime, notes: o.notes,
+        prepStatus: o.prepStatus, items: o.items.map((i) => ({ name: i.name, quantity: i.quantity, ...(i.notes ? { notes: i.notes } : {}) })),
+      }));
+    return this.delay(tickets);
+  }
+  subscribeKitchen(_restaurantId: string, onChange: () => void) {
+    this.listeners.add(onChange);
+    return () => void this.listeners.delete(onChange);
+  }
+
+  // Equipo y auditoría: en la demo no hay cuentas ni registro
+  async listStaff() {
+    return [];
+  }
+  async addStaff(): Promise<void> {
+    throw new Error(NO_ACCOUNTS);
+  }
+  async changeStaffRole(): Promise<void> {
+    throw new Error(NO_ACCOUNTS);
+  }
+  async removeStaff(): Promise<void> {
+    throw new Error(NO_ACCOUNTS);
+  }
+  async listAudit() {
+    return [];
+  }
+  async setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string) {
+    if (suspended && reason.trim().length < 3) throw new Error('Indica el motivo de la suspensión');
+    this.db.restaurants = this.db.restaurants.map((r) => (r.id === restaurantId ? { ...r, suspended } : r));
+    this.commit();
   }
 
   async resetDemo() {

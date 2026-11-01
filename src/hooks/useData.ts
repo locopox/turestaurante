@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { data, type Menu } from '../services';
-import type { Order, Restaurant, StaffSession } from '../types';
+import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession } from '../types';
 
 interface Loadable<T> {
   value: T | undefined;
@@ -62,6 +62,16 @@ export const useCustomerOrder = (orderId: string | null, accessToken: string | n
 
 /** Sesión del personal. `value` es null si no hay sesión. */
 export const useSession = () => useLoad<StaffSession | null>(() => data.getSession(), (cb) => data.onAuthChange(cb), []);
+
+/** Comandas de cocina (sin datos personales ni importes). */
+export const useKitchenOrders = (restaurantId: string) =>
+  useLoad<KitchenTicket[]>(() => data.listKitchenOrders(restaurantId), (cb) => data.subscribeKitchen(restaurantId, cb), [restaurantId]);
+
+export const useStaff = (restaurantId: string) =>
+  useLoad<StaffMember[]>(() => data.listStaff(restaurantId), null, [restaurantId]);
+
+export const useAudit = (restaurantId: string | null) =>
+  useLoad<AuditEntry[]>(() => data.listAudit(restaurantId), null, [restaurantId]);
 
 /** Reloj que se actualiza periódicamente (tiempos de espera en cocina). */
 export function useNow(intervalMs = 30000) {

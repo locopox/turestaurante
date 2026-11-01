@@ -15,17 +15,17 @@ const restaurants: Restaurant[] = [
   {
     id: 'r-piazza', slug: 'la-piazza', name: 'La Piazza', tagline: 'Pizzería y trattoria · horno de leña',
     address: 'Calle Mayor 12, Madrid', phone: '910 000 000', active: true, tables: 12,
-    pickupEnabled: true, onlinePaymentEnabled: true, counterPaymentEnabled: true, prepMinutes: 18, createdAt: created,
+    pickupEnabled: true, onlinePaymentEnabled: true, counterPaymentEnabled: true, prepMinutes: 18, createdAt: created, suspended: false,
   },
   {
     id: 'r-sakura', slug: 'sakura-ramen', name: 'Sakura Ramen', tagline: 'Ramen y gyozas caseras',
     address: 'Av. del Puerto 3, Valencia', phone: '960 000 000', active: true, tables: 8,
-    pickupEnabled: true, onlinePaymentEnabled: true, counterPaymentEnabled: true, prepMinutes: 12, createdAt: created,
+    pickupEnabled: true, onlinePaymentEnabled: true, counterPaymentEnabled: true, prepMinutes: 12, createdAt: created, suspended: false,
   },
   {
     id: 'r-fogon', slug: 'el-fogon', name: 'El Fogón', tagline: 'Tacos al pastor y antojitos',
     address: 'Plaza Nueva 7, Sevilla', phone: '950 000 000', active: false, tables: 6,
-    pickupEnabled: true, onlinePaymentEnabled: false, counterPaymentEnabled: true, prepMinutes: 10, createdAt: created,
+    pickupEnabled: true, onlinePaymentEnabled: false, counterPaymentEnabled: true, prepMinutes: 10, createdAt: created, suspended: false,
   },
 ];
 

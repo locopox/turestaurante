@@ -1,7 +1,7 @@
 import type { AuthRedirect } from '../lib/authRedirect';
 import type {
-  Category, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
-  PrepStatus, Product, Restaurant, StaffSession,
+  AuditEntry, Category, KitchenTicket, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
+  PrepStatus, Product, Restaurant, StaffMember, StaffRole, StaffSession,
 } from '../types';
 
 export interface Menu {
@@ -68,6 +68,21 @@ export interface DataService {
   markPaidAtCounter(orderId: string): Promise<void>;
   subscribeOrders(restaurantId: string, onChange: () => void): Unsubscribe;
   subscribeCatalog(onChange: () => void): Unsubscribe;
+  /** Comandas de cocina: sin teléfono, importes ni pago (kitchen_orders). */
+  listKitchenOrders(restaurantId: string): Promise<KitchenTicket[]>;
+  subscribeKitchen(restaurantId: string, onChange: () => void): Unsubscribe;
+
+  // Equipo (staff_* en la base de datos, con las reglas de cada rol)
+  listStaff(restaurantId: string): Promise<StaffMember[]>;
+  /** Añade una cuenta que ya existe. Las invitaciones por correo llegarán en otra fase. */
+  addStaff(restaurantId: string, email: string, role: StaffRole): Promise<void>;
+  changeStaffRole(restaurantId: string, userId: string, role: StaffRole): Promise<void>;
+  removeStaff(restaurantId: string, userId: string): Promise<void>;
+
+  // Plataforma y auditoría
+  setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string): Promise<void>;
+  /** restaurantId null: registro completo (solo plataforma). */
+  listAudit(restaurantId: string | null): Promise<AuditEntry[]>;
 
   /**
    * Resultado de la pasarela SIMULADA del modo demo. Con Supabase lanza error: el estado del

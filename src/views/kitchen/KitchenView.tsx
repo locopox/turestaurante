@@ -1,9 +1,9 @@
 import { useToast } from '../../components/Toast';
 import { Icon, Spinner } from '../../components/ui';
-import { useNow, useOrders } from '../../hooks/useData';
-import { formatTime, isKitchenVisible, minutesSince, nextPrep, orderCode, originLabel } from '../../lib/format';
+import { useKitchenOrders, useNow } from '../../hooks/useData';
+import { formatTime, minutesSince, nextPrep, orderCode, originLabel } from '../../lib/format';
 import { data } from '../../services';
-import type { Order, PrepStatus, Restaurant } from '../../types';
+import type { KitchenTicket, PrepStatus, Restaurant } from '../../types';
 
 const columns: { status: PrepStatus; title: string }[] = [
   { status: 'nuevo', title: 'Nuevos' },
@@ -13,13 +13,20 @@ const columns: { status: PrepStatus; title: string }[] = [
 const back: Partial<Record<PrepStatus, PrepStatus>> = { en_preparacion: 'nuevo', listo: 'en_preparacion' };
 
 export function KitchenView({ restaurant }: { restaurant: Restaurant }) {
-  const { value: orders = [], loading } = useOrders(restaurant.id);
+  // Comandas preparadas por la base de datos: sin teléfono, importes ni pago, y sin pedidos con
+  // pago online pendiente.
+  const { value: orders = [], loading, reload } = useKitchenOrders(restaurant.id);
   const now = useNow(15000);
   const toast = useToast();
-  const queue = orders.filter(isKitchenVisible).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const queue = orders;
 
-  const move = async (o: Order, to: PrepStatus) => {
-    try { await data.updatePrepStatus(o.id, to); } catch (e) { toast((e as Error).message, 'danger'); }
+  const move = async (o: KitchenTicket, to: PrepStatus) => {
+    try {
+      await data.updatePrepStatus(o.id, to);
+      reload();
+    } catch (e) {
+      toast((e as Error).message, 'danger');
+    }
   };
 
   return (
@@ -58,8 +65,8 @@ export function KitchenView({ restaurant }: { restaurant: Restaurant }) {
                         </div>
                         <p className="ticket__origin"><Icon name={o.mode === 'mesa' ? 'table' : 'bag'} size={18} /> {originLabel(o)}</p>
                         <ul className="ticket__items">
-                          {o.items.map((i) => (
-                            <li key={i.productId}>
+                          {o.items.map((i, idx) => (
+                            <li key={idx}>
                               <span className="ticket__qty mono">{i.quantity}×</span>
                               <span>{i.name}{i.notes && <em className="ticket__note">{i.notes}</em>}</span>
                             </li>

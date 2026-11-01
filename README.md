@@ -48,6 +48,8 @@ src/
   data/seed.ts                 Datos de demostración del modo demo
   lib/orderRules.ts            Reglas de pedido (las mismas que create_order) y token del cliente
   lib/permissions.ts           Qué ve cada rol en la interfaz (la base de datos decide de verdad)
+  lib/authRedirect.ts          Enlaces de recuperación de contraseña y reglas de contraseña
+  lib/audit.ts                 Textos del registro de auditoría
   services/
     dataService.ts             Interfaz única de datos (la UI solo usa esto)
     mock/mockDataService.ts    Implementación local del modo demo
@@ -60,6 +62,7 @@ src/
 supabase/
   schema.sql                   Tablas, funciones, RLS, triggers de integridad y tiempo real (repetible)
   seed.sql                     Datos de La Piazza (repetible, sin duplicar)
+  migrations/                  Migraciones versionadas (fase 3) · migrations_down/: cómo deshacerlas
   tests/                       Pruebas SQL contra un PostgreSQL local
 ```
 
@@ -67,13 +70,26 @@ supabase/
 
 | Quién | Qué puede hacer |
 |---|---|
-| Cliente sin cuenta | Leer la carta. Crear pedidos con `create_order`. Leer **solo su pedido** con su token (`get_customer_order`). Pasar de pago online pendiente a caja. Nada más: no puede leer ni modificar tablas de pedidos. |
-| `kitchen` | Ver pedidos de su restaurante (sin los de pago online pendiente) y cambiar su preparación. No cobra, no cancela y no toca la carta ni la configuración. |
-| `waiter` | Lo de cocina, y además ver todos los pedidos, cobrar en caja y cancelar. |
-| `manager` / `owner` | Lo anterior, y además editar la carta y la configuración de su restaurante. |
-| Administrador de plataforma | Todo, en todos los restaurantes. Crear restaurantes y asignar personal. |
+| Cliente sin cuenta | Leer la carta. Crear pedidos con `create_order`. Leer **solo su pedido** con su token (`get_customer_order`). Pasar de pago online pendiente a caja. Nada más. |
+| `kitchen` (cocina) | Ver las comandas de su restaurante con `kitchen_orders` (**sin teléfono, importes ni pagos**; nombre solo en pedidos para recoger) y cambiar su preparación. No lee la tabla de pedidos, no cobra, no cancela, no toca la carta, la configuración ni el equipo. |
+| `waiter` (sala) | Ver los pedidos de su restaurante (con el teléfono para avisar al cliente), cambiar la preparación, cobrar en caja y cancelar. |
+| `manager` (encargado) | Lo de sala, más la carta y los precios, y el equipo de **sala y cocina** (alta, cambio de función, baja). No toca propietarios ni encargados, ni la configuración del restaurante. |
+| `owner` (propietario) | Todo lo anterior en **su** restaurante, la configuración del restaurante, los encargados y el registro de auditoría. No nombra propietarios. |
+| Plataforma (`platform_admins`) | Crear restaurantes, cambiar su dirección web, suspenderlos y reactivarlos, gestionar propietarios y leer el registro (sus consultas quedan registradas). **No tiene acceso operativo**: no ve pedidos, cocina ni avisos de pago, ni edita la carta. Una cuenta de plataforma no puede ser personal de ningún restaurante. |
 | Servidor (`service_role`) | Administrar restaurantes, carta y personal. Sobre pedidos y pagos solo **lee**: los cambia únicamente con `payment_checkout_started` y `payment_record_result`. No tiene permisos sobre tablas ajenas a TuRestaurante. |
 
+- **Equipo**: nadie escribe directamente en `restaurant_staff`; se usa `staff_add_member`, `staff_change_role` y
+  `staff_remove_member`. Nadie cambia ni quita su propio acceso, y siempre queda al menos un propietario.
+- **Suspensión**: `restaurants.suspended_at` solo lo cambia la plataforma (`platform_set_suspension`). Un restaurante
+  suspendido no acepta pedidos aunque su propietario lo marque como abierto; el personal puede terminar los ya hechos.
+  El motivo se guarda en el registro, no en la tabla pública de restaurantes.
+- **Dirección web (`slug`)**: solo la plataforma puede cambiarla, porque invalida los QR impresos.
+- **Registro de auditoría** (`private.audit_log`, solo se añade): altas, cambios y bajas de personal, precios,
+  productos, cancelaciones, cobros, pagos verificados, suspensiones, dirección web, apertura y consultas de la
+  plataforma. Guarda quién (usuario y tipo), cuándo y qué. Lo leen el propietario (su restaurante) y la plataforma
+  con `audit_list`.
+- **Modo soporte** (que la plataforma intervenga en un restaurante): **pendiente de decisión**, no implementado.
+  Mientras tanto, la plataforma no tiene ninguna vía de acceso operativo.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
@@ -85,12 +101,31 @@ supabase/
 
 ```bash
 npm test          # reglas de pedido, modo demo, permisos y variables de entorno (Vitest)
-npm run test:db   # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase)
+npm run test:db         # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase)
+npm run test:migration  # migración de la fase 3: subida, repetición y bajada (PostgreSQL LOCAL)
 ```
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
 `PGHOST`/`PGPORT`/`PGUSER`, carga `supabase/tests/supabase_shim.sql` (imita los roles de Supabase),
 `schema.sql` y `seed.sql`, dos veces cada uno, y ejecuta `supabase/tests/security_test.sql`.
+
+## Migraciones
+
+- `supabase/schema.sql` es el esquema completo (instalación nueva; se puede repetir).
+- `supabase/migrations/20261101120000_fase3_seguridad_roles.sql` actualiza una base que ya tiene el esquema
+  anterior (rama `fase2-recuperar-contrasena`). No borra datos.
+- `supabase/migrations_down/…down.sql` la deshace. **Borra el registro de auditoría y las suspensiones.**
+- `npm run test:migration` comprueba en local que subir deja la base idéntica a una instalación nueva, que se puede
+  repetir, que bajar restaura la versión anterior y que los datos no cambian.
+
+Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
+hace falta una cuenta de personal distinta (por ejemplo, un propietario), que la plataforma añade en
+Administración → Equipo, o desde el SQL Editor:
+
+```sql
+insert into public.restaurant_staff (restaurant_id, user_id, role)
+select '5e5e0000-0000-4000-8000-000000000001', id, 'owner' from auth.users where email = 'propietario@ejemplo.com';
+```
 
 ## Conectar Supabase paso a paso
 

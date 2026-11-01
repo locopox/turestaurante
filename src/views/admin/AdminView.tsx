@@ -4,28 +4,39 @@ import { ART_OPTIONS, FoodArt } from '../../components/FoodArt';
 import { useToast } from '../../components/Toast';
 import { Badge, Icon, Modal, Notice, Spinner } from '../../components/ui';
 import { config, onlinePaymentsAvailable } from '../../config';
-import { useMenu, useOrders, useRestaurants } from '../../hooks/useData';
+import { useAudit, useMenu, useOrders, useRestaurants, useStaff } from '../../hooks/useData';
 import { hrefFor } from '../../hooks/useRoute';
+import { auditActionLabel, auditActor, auditDetails } from '../../lib/audit';
 import { formatPrice, slugify } from '../../lib/format';
 import { data } from '../../services';
-import { can } from '../../lib/permissions';
-import type { FoodArt as Art, Product, Restaurant, StaffSession } from '../../types';
+import { can, canOpenAdmin, manageableRoles, roleLabel } from '../../lib/permissions';
+import type { FoodArt as Art, Product, Restaurant, StaffRole, StaffSession } from '../../types';
 
-type Tab = 'datos' | 'carta' | 'qr';
+type Tab = 'datos' | 'carta' | 'equipo' | 'registro' | 'qr';
 
 export function AdminView({ selectedId, onSelect, session }: { selectedId: string; onSelect: (id: string) => void; session: StaffSession | null }) {
   const { value: all = [], loading } = useRestaurants();
   // Solo los restaurantes que este usuario puede administrar (la base de datos lo aplica igualmente).
-  const restaurants = all.filter((r) => can(session, r.id, 'restaurant.edit'));
+  const restaurants = all.filter((r) => canOpenAdmin(session, r.id));
   const [tab, setTab] = useState<Tab>('datos');
   const [creating, setCreating] = useState(false);
   const current = restaurants.find((r) => r.id === selectedId) ?? restaurants[0];
+  const isPlatform = !!session?.isPlatformAdmin;
+  // Pestañas según lo que el usuario puede hacer en ese restaurante.
+  const tabs = ([
+    ['datos', 'Datos y opciones', true],
+    ['carta', 'Carta', can(session, current?.id, 'menu.edit')],
+    ['equipo', 'Equipo', can(session, current?.id, 'staff.manage')],
+    ['registro', 'Registro', can(session, current?.id, 'audit.view')],
+    ['qr', 'Mesas y QR', true],
+  ] as const).filter(([, , show]) => show);
+  const activeTab: Tab = tabs.some(([id]) => id === tab) ? tab : 'datos';
 
   return (
     <div className="page">
       <header className="page-head">
         <div>
-          <span className="eyebrow">Administración de la plataforma</span>
+          <span className="eyebrow">{isPlatform ? 'Administración de la plataforma' : 'Administración del restaurante'}</span>
           <h1>Restaurantes</h1>
         </div>
         {can(session, undefined, 'restaurant.create') && (
@@ -45,7 +56,9 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
                       <strong>{r.name}</strong>
                       <span className="muted small">/{r.slug} · {r.tables} mesas</span>
                     </span>
-                    <Badge tone={r.active ? 'ok' : 'neutral'}>{r.active ? 'Activo' : 'Pausado'}</Badge>
+                    {r.suspended
+                      ? <Badge tone="danger">Suspendido</Badge>
+                      : <Badge tone={r.active ? 'ok' : 'neutral'}>{r.active ? 'Activo' : 'Pausado'}</Badge>}
                   </button>
                 </li>
               ))}
@@ -54,15 +67,25 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
 
           {current && (
             <section className="admin__detail" aria-label={`Configuración de ${current.name}`}>
-              <RestaurantSummary restaurant={current} />
+              {current.suspended && (
+                <Notice tone="danger">
+                  Restaurante <strong>suspendido por la plataforma</strong>: no acepta pedidos nuevos. Los pedidos ya hechos se pueden terminar.
+                </Notice>
+              )}
+              <RestaurantSummary restaurant={current} showOrders={can(session, current.id, 'orders.view')} />
               <div className="segmented" role="tablist" aria-label="Secciones">
-                {([['datos', 'Datos y opciones'], ['carta', 'Carta'], ['qr', 'Mesas y QR']] as const).map(([id, label]) => (
-                  <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'is-active' : ''} onClick={() => setTab(id)}>{label}</button>
+                {tabs.map(([id, label]) => (
+                  <button key={id} role="tab" aria-selected={activeTab === id} className={activeTab === id ? 'is-active' : ''} onClick={() => setTab(id)}>{label}</button>
                 ))}
               </div>
-              {tab === 'datos' && <RestaurantForm key={current.id} restaurant={current} />}
-              {tab === 'carta' && <MenuEditor key={current.id} restaurant={current} />}
-              {tab === 'qr' && <QrSheet key={current.id} restaurant={current} />}
+              {activeTab === 'datos' && (
+                <RestaurantForm key={current.id} restaurant={current} canEdit={can(session, current.id, 'restaurant.edit')}
+                  isPlatform={can(session, current.id, 'platform.manage')} />
+              )}
+              {activeTab === 'carta' && <MenuEditor key={current.id} restaurant={current} />}
+              {activeTab === 'equipo' && <TeamPanel key={current.id} restaurant={current} session={session} />}
+              {activeTab === 'registro' && <AuditPanel key={current.id} restaurant={current} />}
+              {activeTab === 'qr' && <QrSheet key={current.id} restaurant={current} />}
             </section>
           )}
         </div>
@@ -72,9 +95,18 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
   );
 }
 
-function RestaurantSummary({ restaurant }: { restaurant: Restaurant }) {
-  const { value: orders } = useOrders(restaurant.id);
+function RestaurantSummary({ restaurant, showOrders }: { restaurant: Restaurant; showOrders: boolean }) {
+  const { value: orders } = useOrders(showOrders ? restaurant.id : undefined);
   const { value: menu } = useMenu(restaurant.id);
+  if (!showOrders) {
+    // Sin acceso a pedidos (por ejemplo, la plataforma): solo datos de la carta, que es pública.
+    return (
+      <div className="stats stats--compact">
+        <div className="stat"><span className="stat__label">Productos</span><strong className="stat__value">{menu?.products.length ?? '–'}</strong><span className="stat__sub">{menu?.products.filter((p) => !p.available).length ?? 0} agotados</span></div>
+        <div className="stat"><span className="stat__label">Pedidos</span><strong className="stat__value">—</strong><span className="stat__sub">sin acceso operativo</span></div>
+      </div>
+    );
+  }
   if (!orders || !menu) return <div className="stats stats--compact" aria-busy="true"><div className="stat"><span className="stat__label">Cargando resumen…</span></div></div>;
   const active = orders.filter((o) => ['nuevo', 'en_preparacion', 'listo'].includes(o.prepStatus)).length;
   const total = orders.filter((o) => o.prepStatus !== 'cancelado').reduce((s, o) => s + o.total, 0);
@@ -97,7 +129,7 @@ function Toggle({ id, label, hint, checked, onChange, disabled }: { id: string; 
   );
 }
 
-function RestaurantForm({ restaurant }: { restaurant: Restaurant }) {
+function RestaurantForm({ restaurant, canEdit, isPlatform }: { restaurant: Restaurant; canEdit: boolean; isPlatform: boolean }) {
   const toast = useToast();
   const [r, setR] = useState(restaurant);
   const [saving, setSaving] = useState(false);
@@ -114,10 +146,17 @@ function RestaurantForm({ restaurant }: { restaurant: Restaurant }) {
   };
 
   return (
+    <div className="stack-lg">
+    {isPlatform && <SuspensionPanel restaurant={restaurant} />}
     <form className="card stack-lg" onSubmit={save}>
+      {!canEdit && <Notice>Solo el propietario puede cambiar estos datos.</Notice>}
+      <fieldset className="fieldset" disabled={!canEdit}>
       <div className="form-grid">
         <label className="field"><span>Nombre</span><input id="rf-name" value={r.name} onChange={(e) => set('name', e.target.value)} /></label>
-        <label className="field"><span>Dirección web (slug)</span><input id="rf-slug" value={r.slug} onChange={(e) => set('slug', slugify(e.target.value))} /></label>
+        <label className="field"><span>Dirección web (slug)</span>
+          <input id="rf-slug" value={r.slug} disabled={!isPlatform} onChange={(e) => set('slug', slugify(e.target.value))} />
+          {!isPlatform && <small className="muted">Solo la plataforma puede cambiarla: cambiarla invalida los QR impresos.</small>}
+        </label>
         <label className="field field--wide"><span>Descripción corta</span><input id="rf-tagline" value={r.tagline} onChange={(e) => set('tagline', e.target.value)} /></label>
         <label className="field"><span>Dirección</span><input id="rf-address" value={r.address} onChange={(e) => set('address', e.target.value)} /></label>
         <label className="field"><span>Teléfono</span><input id="rf-phone" value={r.phone} onChange={(e) => set('phone', e.target.value)} /></label>
@@ -134,11 +173,154 @@ function RestaurantForm({ restaurant }: { restaurant: Restaurant }) {
         )}
         <Toggle id="rf-counter" label="Pago en caja" checked={r.counterPaymentEnabled} onChange={(v) => set('counterPaymentEnabled', v)} />
       </div>
-      <div className="row">
-        <button type="submit" className="btn btn--primary" disabled={!dirty || saving}>{saving ? 'Guardando…' : 'Guardar cambios'}</button>
-        {dirty && <button type="button" className="btn btn--ghost" onClick={() => setR(restaurant)}>Descartar</button>}
-      </div>
+      </fieldset>
+      {canEdit && (
+        <div className="row">
+          <button type="submit" className="btn btn--primary" disabled={!dirty || saving}>{saving ? 'Guardando…' : 'Guardar cambios'}</button>
+          {dirty && <button type="button" className="btn btn--ghost" onClick={() => setR(restaurant)}>Descartar</button>}
+        </div>
+      )}
     </form>
+    </div>
+  );
+}
+
+/** Solo plataforma: suspender o reactivar. El motivo queda en el registro de auditoría. */
+function SuspensionPanel({ restaurant }: { restaurant: Restaurant }) {
+  const toast = useToast();
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const apply = async (suspended: boolean) => {
+    setBusy(true);
+    try {
+      await data.setRestaurantSuspension(restaurant.id, suspended, reason);
+      toast(suspended ? `${restaurant.name} suspendido` : `${restaurant.name} reactivado`);
+      setReason('');
+    } catch (e) {
+      toast((e as Error).message, 'danger');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="card stack">
+      <h3 className="card__title">Suspensión (plataforma)</h3>
+      <p className="muted small">
+        {restaurant.suspended
+          ? 'Suspendido: no acepta pedidos nuevos aunque el restaurante se marque como abierto.'
+          : 'Activo para la plataforma. Si lo suspendes, el restaurante no podrá reactivarse por sí mismo.'}
+      </p>
+      <label className="field">
+        <span>Motivo {restaurant.suspended ? '(opcional)' : '(obligatorio)'}</span>
+        <input id="susp-reason" value={reason} maxLength={200} onChange={(e) => setReason(e.target.value)} placeholder="Queda en el registro de auditoría" />
+      </label>
+      <div className="row">
+        {restaurant.suspended
+          ? <button type="button" className="btn btn--primary" disabled={busy} onClick={() => apply(false)}>Reactivar</button>
+          : <button type="button" className="btn btn--danger" disabled={busy || reason.trim().length < 3} onClick={() => apply(true)}>Suspender</button>}
+      </div>
+    </section>
+  );
+}
+
+/** Equipo del restaurante. Cada acción la valida la base de datos (staff_add_member, etc.). */
+function TeamPanel({ restaurant, session }: { restaurant: Restaurant; session: StaffSession | null }) {
+  const toast = useToast();
+  const { value: members = [], loading, error, reload } = useStaff(restaurant.id);
+  const roles = manageableRoles(session, restaurant.id);
+  const [email, setEmail] = useState('');
+  const [role, setRole] = useState<StaffRole>(roles.includes('waiter') ? 'waiter' : roles[0] ?? 'waiter');
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const run = async (fn: () => Promise<void>, ok: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      toast(ok);
+      reload();
+    } catch (e) {
+      toast((e as Error).message, 'danger');
+    } finally {
+      setBusy(false);
+      setRemoving(null);
+    }
+  };
+
+  return (
+    <div className="stack-lg">
+      {data.kind === 'mock' && <Notice>En el modo demo no hay cuentas de personal. El equipo se gestiona conectando Supabase.</Notice>}
+      <form className="card stack" onSubmit={(e) => { e.preventDefault(); if (email.trim()) void run(async () => { await data.addStaff(restaurant.id, email, role); setEmail(''); }, 'Persona añadida al equipo'); }}>
+        <h3 className="card__title">Añadir al equipo</h3>
+        <p className="muted small">La cuenta tiene que existir ya (Supabase → Authentication → Users). Las invitaciones por correo llegarán en una fase posterior.</p>
+        <div className="form-grid">
+          <label className="field"><span>Email</span><input id="team-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+          <label className="field"><span>Función</span>
+            <select id="team-role" value={role} onChange={(e) => setRole(e.target.value as StaffRole)}>
+              {roles.map((r) => <option key={r} value={r}>{roleLabel[r]}</option>)}
+            </select>
+          </label>
+        </div>
+        <button className="btn btn--primary" type="submit" disabled={busy || !email.trim()}>Añadir</button>
+      </form>
+      <section className="card">
+        <h3 className="card__title">Equipo</h3>
+        {error && <Notice tone="danger">{error}</Notice>}
+        {loading && !members.length ? <Spinner /> : (
+          <ul className="team">
+            {members.map((m) => {
+              const manageable = !m.isMe && roles.includes(m.role);
+              return (
+                <li key={m.userId} className="team__row">
+                  <span className="team__who"><strong>{m.email}</strong>{m.isMe && <span className="muted small"> (tú)</span>}</span>
+                  {manageable ? (
+                    <label className="team__role">
+                      <span className="sr-only">Función de {m.email}</span>
+                      <select value={m.role} disabled={busy}
+                        onChange={(e) => run(() => data.changeStaffRole(restaurant.id, m.userId, e.target.value as StaffRole), 'Función cambiada')}>
+                        {roles.map((r) => <option key={r} value={r}>{roleLabel[r]}</option>)}
+                      </select>
+                    </label>
+                  ) : <Badge tone="neutral">{roleLabel[m.role]}</Badge>}
+                  {manageable && (removing === m.userId ? (
+                    <span className="row">
+                      <button className="btn btn--danger btn--sm" disabled={busy} onClick={() => run(() => data.removeStaff(restaurant.id, m.userId), 'Acceso retirado')}>Retirar acceso</button>
+                      <button className="btn btn--ghost btn--sm" onClick={() => setRemoving(null)}>No</button>
+                    </span>
+                  ) : <button className="btn btn--ghost btn--sm" onClick={() => setRemoving(m.userId)}>Quitar</button>)}
+                </li>
+              );
+            })}
+            {!members.length && !loading && <li className="muted small">Sin personas en el equipo.</li>}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** Registro de auditoría del restaurante (owner y plataforma). */
+function AuditPanel({ restaurant }: { restaurant: Restaurant }) {
+  const { value: entries = [], loading, error } = useAudit(restaurant.id);
+  return (
+    <section className="card">
+      <h3 className="card__title">Registro de actividad</h3>
+      {data.kind === 'mock' && <Notice>En el modo demo no se guarda registro.</Notice>}
+      {error && <Notice tone="danger">{error}</Notice>}
+      {loading && !entries.length ? <Spinner /> : (
+        <ul className="audit">
+          {entries.map((e, i) => (
+            <li key={i} className="audit__row">
+              <span className="muted small mono">{new Date(e.createdAt).toLocaleString('es-ES')}</span>
+              <strong>{auditActionLabel[e.action] ?? e.action}</strong>
+              <span className="small">{auditActor(e)}</span>
+              {Object.keys(e.details).length > 0 && <span className="muted small">{auditDetails(e.details)}</span>}
+            </li>
+          ))}
+          {!entries.length && !loading && data.kind !== 'mock' && <li className="muted small">Sin actividad registrada.</li>}
+        </ul>
+      )}
+    </section>
   );
 }
 

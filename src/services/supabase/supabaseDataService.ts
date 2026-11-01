@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { friendlyAuthError, parseAuthRedirect, PASSWORD_MIN, type AuthRedirect } from '../../lib/authRedirect';
-import type { Category, Order, Product, Restaurant, StaffRole, StaffSession } from '../../types';
+import type { AuditEntry, Category, KitchenTicket, Order, Product, Restaurant, StaffMember, StaffRole, StaffSession } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 /**
@@ -20,6 +20,7 @@ const toRestaurant = (r: Row): Restaurant => ({
   id: r.id, slug: r.slug, name: r.name, tagline: r.tagline ?? '', address: r.address ?? '', phone: r.phone ?? '',
   active: r.active, tables: r.tables, pickupEnabled: r.pickup_enabled, onlinePaymentEnabled: r.online_payment_enabled,
   counterPaymentEnabled: r.counter_payment_enabled, prepMinutes: r.prep_minutes, createdAt: r.created_at,
+  suspended: r.suspended_at != null,
 });
 const fromRestaurant = (r: Partial<Restaurant>): Row => ({
   slug: r.slug, name: r.name, tagline: r.tagline, address: r.address, phone: r.phone, active: r.active,
@@ -353,5 +354,60 @@ export class SupabaseDataService implements DataService {
   }
   subscribeCatalog(onChange: () => void) {
     return this.listen('catalog', [{ table: 'products' }, { table: 'restaurants' }], onChange);
+  }
+
+  // ---------- Cocina (kitchen_orders: sin teléfono, importes ni pago) ----------
+  async listKitchenOrders(restaurantId: string): Promise<KitchenTicket[]> {
+    const { data, error } = await (await this.client).rpc('kitchen_orders', { p_restaurant_id: restaurantId });
+    if (error) throw new Error(friendly(error.message));
+    return ((data ?? []) as Row[]).map((t) => ({
+      id: t.id, number: t.number, createdAt: t.createdAt, mode: t.mode, table: t.table ?? null,
+      customerName: t.customerName ?? null, pickupTime: t.pickupTime ?? null, notes: t.notes ?? '',
+      prepStatus: t.prepStatus,
+      items: (t.items ?? []).map((i: Row) => ({ name: i.name, quantity: i.quantity, ...(i.notes ? { notes: i.notes } : {}) })),
+    }));
+  }
+  subscribeKitchen(restaurantId: string, onChange: () => void) {
+    // Cocina no puede leer la tabla de pedidos, así que Realtime no le avisa: consulta cada pocos
+    // segundos. (Para owner, manager y sala, Realtime avisa al momento.)
+    const stopRealtime = this.subscribeOrders(restaurantId, onChange);
+    const id = setInterval(onChange, CUSTOMER_POLL_MS);
+    return () => {
+      clearInterval(id);
+      stopRealtime();
+    };
+  }
+
+  // ---------- Equipo ----------
+  private async rpcVoid(fn: string, args: Record<string, unknown>) {
+    const { error } = await (await this.client).rpc(fn, args);
+    if (error) throw new Error(friendly(error.message));
+  }
+  async listStaff(restaurantId: string): Promise<StaffMember[]> {
+    const { data, error } = await (await this.client).rpc('staff_list', { p_restaurant_id: restaurantId });
+    if (error) throw new Error(friendly(error.message));
+    return ((data ?? []) as Row[]).map((m) => ({ userId: m.user_id, email: m.email, role: m.role, isMe: !!m.is_me }));
+  }
+  addStaff(restaurantId: string, email: string, role: StaffRole) {
+    return this.rpcVoid('staff_add_member', { p_restaurant_id: restaurantId, p_email: email.trim(), p_role: role });
+  }
+  changeStaffRole(restaurantId: string, userId: string, role: StaffRole) {
+    return this.rpcVoid('staff_change_role', { p_restaurant_id: restaurantId, p_user_id: userId, p_role: role });
+  }
+  removeStaff(restaurantId: string, userId: string) {
+    return this.rpcVoid('staff_remove_member', { p_restaurant_id: restaurantId, p_user_id: userId });
+  }
+
+  // ---------- Plataforma y auditoría ----------
+  setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string) {
+    return this.rpcVoid('platform_set_suspension', { p_restaurant_id: restaurantId, p_suspended: suspended, p_reason: reason });
+  }
+  async listAudit(restaurantId: string | null): Promise<AuditEntry[]> {
+    const { data, error } = await (await this.client).rpc('audit_list', { p_restaurant_id: restaurantId, p_limit: 200 });
+    if (error) throw new Error(friendly(error.message));
+    return ((data ?? []) as Row[]).map((a) => ({
+      createdAt: a.created_at, action: a.action, actorEmail: a.actor_email ?? null, actorKind: a.actor_kind,
+      targetTable: a.target_table ?? null, targetId: a.target_id ?? null, details: a.details ?? {},
+    }));
   }
 }

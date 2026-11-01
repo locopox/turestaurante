@@ -13,7 +13,7 @@ export const orderCode = (n: number) => `#${n}`;
 
 export const itemCount = (o: Pick<Order, 'items'>) => o.items.reduce((s, i) => s + i.quantity, 0);
 
-export function originLabel(o: Order): string {
+export function originLabel(o: Pick<Order, 'mode' | 'table' | 'pickupTime' | 'customerName'>): string {
   if (o.mode === 'mesa') return `Mesa ${o.table ?? '?'}`;
   const when = !o.pickupTime || o.pickupTime === 'asap' ? 'lo antes posible' : `a las ${o.pickupTime}`;
   return `Recoger ${when}${o.customerName ? ` · ${o.customerName}` : ''}`;

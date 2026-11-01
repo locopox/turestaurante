@@ -47,7 +47,8 @@ export function CustomerApp({ restaurant, qrTable }: { restaurant: Restaurant; q
       return next;
     });
 
-  if (!restaurant.active)
+  // Cerrado por el restaurante o suspendido por la plataforma.
+  if (!restaurant.active || restaurant.suspended)
     return (
       <div className="cx">
         <CxHeader restaurant={restaurant} qrTable={qrTable} />

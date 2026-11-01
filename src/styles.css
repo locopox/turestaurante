@@ -468,3 +468,10 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .notice--ok { background: var(--ok-soft); color: var(--ink); } .notice--ok .icon { color: var(--ok); }
 .page--notice { padding-block: 16px 0; }
 .link-btn { border: 0; background: none; padding: 0; color: var(--brand); text-decoration: underline; cursor: pointer; font: inherit; }
+.team, .audit { display: grid; }
+.team__row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line); }
+.team__row:first-child, .audit__row:first-child { border-top: 0; }
+.team__who { min-width: 0; overflow-wrap: anywhere; }
+.team__role select { min-height: 36px; border: 1.5px solid var(--line); border-radius: var(--r-sm); background: var(--surface); padding: 4px 8px; }
+.audit__row { display: grid; gap: 2px; padding: 10px 0; border-top: 1px solid var(--line); }
+@media (max-width: 560px) { .team__row { grid-template-columns: 1fr; } }

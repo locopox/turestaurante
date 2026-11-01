@@ -61,6 +61,13 @@ create function tests.online(token int, qty int) returns jsonb language sql stab
     'accessToken', tests.tok(token), 'items', jsonb_build_array(jsonb_build_object('productId', tests.otro_prod(), 'quantity', qty)))
 $$;
 
+-- Usuario de prueba por sufijo: tests.u('a1') = a0000000-0000-4000-8000-0000000000a1
+create function tests.u(code text) returns uuid language sql immutable as $$ select ('a0000000-0000-4000-8000-0000000000' || code)::uuid $$;
+-- ¿Aparece el pedido en la vista de cocina de ese restaurante? (con el rol actual)
+create function tests.in_kitchen(rid uuid, oid uuid) returns boolean language sql as $$
+  select exists (select 1 from jsonb_array_elements(public.kitchen_orders(rid)) t where (t ->> 'id')::uuid = oid)
+$$;
+
 -- ===================== Datos de prueba (como postgres) =====================
 -- Segundo restaurante, con pago online ACTIVADO desde el servidor (lo permite el SQL Editor).
 insert into public.restaurants (id, slug, name, active, tables, pickup_enabled, online_payment_enabled, counter_payment_enabled)
@@ -279,7 +286,7 @@ select tests.ok(tests.affected(format('update public.products set price_cents = 
 select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 99 where id = %L', tests.piazza())) = 0, 'cocina: no puede cambiar la configuración');
 select tests.throws(format('insert into public.categories (restaurant_id, name) values (%L, %L)', tests.piazza(), 'Nueva'), 'row-level security', 'cocina: no puede crear categorías');
 select tests.ok((select count(*) from public.restaurant_staff) = 1, 'cocina: solo ve su propia fila de personal');
-select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), 'a0000000-0000-4000-8000-0000000000a4', 'owner'), 'row-level security', 'cocina: no puede ascenderse a owner');
+select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), 'a0000000-0000-4000-8000-0000000000a4', 'owner'), 'permission denied', 'cocina: no puede ascenderse a owner');
 select tests.throws(format('update public.orders set prep_status = %L where id = %L', 'listo', tests.id('o1')), 'permission denied', 'cocina: no puede actualizar pedidos sin pasar por las funciones');
 
 -- Transiciones de preparación
@@ -314,8 +321,8 @@ select tests.throws($$insert into public.platform_admins (user_id) values ('a000
 
 -- Administrador de plataforma
 select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000ad');
-select tests.ok((select count(distinct restaurant_id) from public.orders) = 2, 'admin: ve pedidos de todos los restaurantes');
-select tests.ok((select count(*) from public.my_memberships()) = 2, 'admin: gestiona todos los restaurantes');
+select tests.ok((select count(*) from public.orders) = 0, 'admin: NO ve pedidos de ningún restaurante (sin acceso operativo)');
+select tests.ok((select count(*) from public.my_memberships()) = 0, 'admin: no aparece como personal de ningún restaurante');
 select tests.ok(tests.affected($$insert into public.restaurants (slug, name) values ('nuevo-sitio', 'Nuevo Sitio')$$) = 1, 'admin: puede crear restaurantes');
 reset role;
 
@@ -331,8 +338,8 @@ select tests.throws($$insert into public.products (restaurant_id, category_id, n
 -- ===================== 6. PEDIDOS ONLINE PENDIENTES Y COCINA =====================
 select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b4');
 set role authenticated;
-select tests.ok((select count(*) from public.orders where id in (tests.id('on1'), tests.id('on2'))) = 0, 'cocina: no ve pedidos con pago online pendiente');
-select tests.ok((select count(*) from public.orders where id = tests.id('on3')) = 1, 'cocina: sí ve el pedido que pasó a pagar en caja');
+select tests.ok(not tests.in_kitchen(tests.otro(), tests.id('on1')) and not tests.in_kitchen(tests.otro(), tests.id('on2')), 'cocina: no ve pedidos con pago online pendiente');
+select tests.ok(tests.in_kitchen(tests.otro(), tests.id('on3')), 'cocina: sí ve el pedido que pasó a pagar en caja');
 select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.id('on1'), 'en_preparacion'), 'no encontrado', 'cocina: no puede preparar un pedido online pendiente');
 select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b1');
 select tests.ok((select count(*) from public.orders where id = tests.id('on1')) = 1, 'owner: sí ve el pedido online pendiente');
@@ -470,8 +477,8 @@ reset role;
 -- Cocina: ve el pedido pagado, no el pendiente
 select tests.claims('authenticated', 'a0000000-0000-4000-8000-0000000000b4');
 set role authenticated;
-select tests.ok((select count(*) from public.orders where id = tests.id('on1')) = 1, 'cocina: ve el pedido cuando el pago está verificado');
-select tests.ok((select count(*) from public.orders where id in (tests.id('on2'), tests.id('on4'))) = 0, 'cocina: no ve pedidos con el pago pendiente');
+select tests.ok(tests.in_kitchen(tests.otro(), tests.id('on1')), 'cocina: ve el pedido cuando el pago está verificado');
+select tests.ok(not tests.in_kitchen(tests.otro(), tests.id('on2')) and not tests.in_kitchen(tests.otro(), tests.id('on4')), 'cocina: no ve pedidos con el pago pendiente');
 reset role;
 
 -- ===================== 8. PASAR A CAJA: RESTAURANTE ACTIVO Y CADUCIDAD (M1) =====================
@@ -552,8 +559,8 @@ reset role;
 select tests.claims(null, null);
 select tests.ok(exists (select 1 from pg_policies where tablename = 'products' and policyname = 'politica_ajena_prueba'),
   'reejecutar el esquema conserva las políticas ajenas al proyecto');
-select tests.ok((select count(*) from pg_policies where schemaname = 'public' and policyname <> 'politica_ajena_prueba') = 15,
-  'reejecutar el esquema deja exactamente las 15 políticas del proyecto');
+select tests.ok((select count(*) from pg_policies where schemaname = 'public' and policyname <> 'politica_ajena_prueba') = 12,
+  'reejecutar el esquema deja exactamente las 12 políticas del proyecto');
 select tests.ok(not has_table_privilege('service_role', 'public.tabla_ajena', 'select')
   and not has_table_privilege('service_role', 'public.tabla_ajena', 'delete'), 'el esquema no da permisos al servidor sobre tablas ajenas');
 select tests.ok(has_table_privilege('service_role', 'public.products', 'update')
@@ -563,6 +570,229 @@ select tests.ok((select column_default from information_schema.columns where tab
   and column_name = 'online_payment_enabled') = 'false', 'pago online desactivado por defecto en restaurantes nuevos');
 select tests.ok((select not online_payment_enabled from public.restaurants where id = tests.piazza()), 'La Piazza (seed) tiene el pago online desactivado');
 select tests.ok((select not online_payment_enabled from public.restaurants where slug = 'nuevo-sitio'), 'restaurante creado desde la app: pago online desactivado');
+
+
+-- ===================== 12. ROLES Y PERMISOS (FASE 3) =====================
+select tests.claims(null, null);
+insert into auth.users (id, email) values
+  (tests.u('a5'), 'nuevo@piazza.test'), (tests.u('a6'), 'extra@piazza.test'), (tests.u('a7'), 'socio@piazza.test'),
+  (tests.u('a8'), 'Mayus@Piazza.test'), (tests.u('b2'), 'manager@otro.test'), (tests.u('ae'), 'admin2@plataforma.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values (tests.otro(), tests.u('b2'), 'manager');
+insert into public.platform_admins (user_id) values (tests.u('ae'));
+
+-- 12.1 La plataforma no tiene acceso operativo a ningún restaurante
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.ok((select count(*) from public.orders) = 0, 'plataforma: no ve pedidos');
+select tests.ok((select count(*) from public.order_items) = 0, 'plataforma: no ve líneas de pedido');
+select tests.ok((select count(*) from public.payment_events) = 0, 'plataforma: no ve avisos de pago');
+select tests.throws(format('select public.kitchen_orders(%L)', tests.piazza()), 'No tienes acceso', 'plataforma: no ve la cocina');
+select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.id('o_rec'), 'en_preparacion'), 'no encontrado', 'plataforma: no cambia la preparación');
+select tests.throws(format('select public.staff_mark_paid_at_counter(%L)', tests.id('o1')), 'no encontrado', 'plataforma: no registra cobros');
+select tests.ok(tests.affected(format('update public.products set price_cents = 1 where restaurant_id = %L', tests.piazza())) = 0, 'plataforma: no cambia precios');
+select tests.throws(format('insert into public.categories (restaurant_id, name) values (%L, %L)', tests.piazza(), 'X'), 'row-level security', 'plataforma: no crea categorías');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin@plataforma.test', 'owner'), 'propio acceso', 'plataforma: no puede añadirse a un restaurante');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin2@plataforma.test', 'owner'), 'plataforma no pueden ser personal', 'plataforma: no puede añadir a otra cuenta de plataforma');
+reset role;
+select tests.claims(null, null);
+select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), tests.u('ae'), 'owner'), 'plataforma no pueden ser personal', 'SQL Editor: una cuenta de plataforma no puede ser personal');
+select tests.throws(format('insert into public.platform_admins (user_id) values (%L)', tests.u('a1')), 'personal de un restaurante', 'SQL Editor: el personal de un restaurante no puede ser plataforma');
+
+-- 12.2 Gestión de equipo: owner
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 4 and (select bool_or(is_me and role = 'owner') from public.staff_list(tests.piazza())), 'owner: ve su equipo con emails');
+select public.staff_add_member(tests.piazza(), 'nuevo@piazza.test', 'waiter');
+select public.staff_add_member(tests.piazza(), '  MAYUS@piazza.TEST ', 'kitchen');
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 6, 'owner: da de alta sala y cocina (email sin distinguir mayúsculas)');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes asignar esa función', 'owner: no puede nombrar propietarios');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'nadie@piazza.test', 'waiter'), 'No hay ninguna cuenta', 'owner: email sin cuenta');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'nuevo@piazza.test', 'kitchen'), 'ya forma parte', 'owner: no duplica miembros');
+select public.staff_change_role(tests.piazza(), tests.u('a5'), 'manager');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a1'), 'manager'), 'propio acceso', 'owner: no cambia su propio rol');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a1')), 'propio acceso', 'owner: no se quita a sí mismo');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a3'), 'owner'), 'No puedes asignar esa función', 'owner: no asciende a nadie a propietario');
+select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), tests.u('a7'), 'waiter'), 'permission denied', 'owner: no escribe directamente en el equipo');
+select tests.throws(format('update public.restaurant_staff set role = %L where user_id = %L', 'owner', tests.u('a3')), 'permission denied', 'owner: no cambia roles directamente');
+select tests.throws(format('insert into public.platform_admins (user_id) values (%L)', tests.u('a1')), 'permission denied', 'owner: no puede hacerse plataforma');
+
+-- 12.3 Gestión de equipo: manager (solo sala y cocina)
+select tests.claims('authenticated', tests.u('a2'));
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 6, 'manager: ve su equipo');
+select public.staff_add_member(tests.piazza(), 'extra@piazza.test', 'kitchen');
+select tests.ok(exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test' and role = 'kitchen'), 'manager: da de alta cocina');
+select public.staff_change_role(tests.piazza(), tests.u('a6'), 'waiter');
+select tests.ok(exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test' and role = 'waiter'), 'manager: cambia cocina ↔ sala');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'manager'), 'No puedes asignar esa función', 'manager: no nombra encargados');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes asignar esa función', 'manager: no nombra propietarios');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a6'), 'manager'), 'No puedes asignar esa función', 'manager: no asciende a encargado');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a6'), 'owner'), 'No puedes asignar esa función', 'manager: no asciende a propietario');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a2'), 'owner'), 'propio acceso', 'manager: no se asciende a sí mismo');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a1'), 'waiter'), 'No puedes gestionar a esa persona', 'manager: no cambia al propietario');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a1')), 'No puedes gestionar a esa persona', 'manager: no quita al propietario');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a5')), 'No puedes gestionar a esa persona', 'manager: no quita a otro encargado');
+select public.staff_remove_member(tests.piazza(), tests.u('a6'));
+select tests.ok(not exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test'), 'manager: retira el acceso a sala/cocina');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.otro(), 'socio@piazza.test', 'waiter'), 'No puedes asignar esa función', 'manager: no gestiona otro restaurante');
+
+-- 12.4 Sala, cocina, usuarios sin rol y otros restaurantes no gestionan equipos
+select tests.claims('authenticated', tests.u('a3'));
+select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'sala: no ve la lista del equipo');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'kitchen'), 'No puedes asignar esa función', 'sala: no da de alta a nadie');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a4')), 'No puedes gestionar a esa persona', 'sala: no quita a nadie');
+select tests.claims('authenticated', tests.u('a4'));
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a4'), 'owner'), 'propio acceso', 'cocina: no se asciende');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a3'), 'kitchen'), 'No puedes gestionar a esa persona', 'cocina: no cambia a otros');
+select tests.throws(format('select public.platform_set_suspension(%L, false, %L)', tests.piazza(), ''), 'Solo la plataforma', 'cocina: no toca la suspensión');
+select tests.claims('authenticated', tests.u('b1'));
+select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'otro restaurante: no ve el equipo de La Piazza');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'waiter'), 'No puedes asignar esa función', 'otro restaurante: no da de alta en La Piazza');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a3')), 'No puedes gestionar a esa persona', 'otro restaurante: no quita personal de La Piazza');
+select tests.claims('authenticated', tests.u('b2'));
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a3'), 'kitchen'), 'No puedes gestionar a esa persona', 'manager de otro restaurante: no gestiona La Piazza');
+select tests.claims('authenticated', tests.u('ee'));
+select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'sin rol: no ve equipos');
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'permission denied', 'anónimo: no puede gestionar equipos');
+reset role;
+
+-- 12.5 Último propietario y propietarios gestionados por la plataforma
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) >= 5, 'plataforma: ve el equipo (consulta registrada)');
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a1')), 'al menos un propietario', 'plataforma: no quita al último propietario');
+select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a1'), 'manager'), 'al menos un propietario', 'plataforma: no degrada al último propietario');
+select public.staff_add_member(tests.piazza(), 'socio@piazza.test', 'owner');
+select tests.ok((select count(*) from public.staff_list(tests.piazza()) where role = 'owner') = 2, 'plataforma: nombra un segundo propietario');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a7')), 'No puedes gestionar a esa persona', 'owner: no quita a otro propietario');
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select public.staff_remove_member(tests.piazza(), tests.u('a7'));
+select tests.ok((select count(*) from public.staff_list(tests.piazza()) where role = 'owner') = 1, 'plataforma: quita un propietario si queda otro');
+reset role;
+
+-- 12.6 Cocina sin datos personales
+select tests.claims('authenticated', tests.u('a4'));
+set role authenticated;
+select tests.ok((select count(*) from public.orders) = 0 and (select count(*) from public.order_items) = 0, 'cocina: no lee la tabla de pedidos');
+select tests.ok((select count(*) from jsonb_array_elements(public.kitchen_orders(tests.piazza()))) >= 1, 'cocina: ve sus comandas');
+select tests.ok(not exists (select 1 from jsonb_array_elements(public.kitchen_orders(tests.piazza())) t
+  where t ? 'customerPhone' or t ? 'total' or t ? 'paymentStatus' or t ? 'paymentRef'), 'cocina: las comandas no incluyen teléfono, importe ni pago');
+select tests.ok(exists (select 1 from jsonb_array_elements(public.kitchen_orders(tests.piazza())) t
+  where (t ->> 'id')::uuid = tests.id('o_rec') and t ->> 'customerName' = 'Ana'), 'cocina: ve el nombre solo para identificar pedidos para recoger');
+select tests.throws(format('select public.kitchen_orders(%L)', tests.otro()), 'No tienes acceso', 'cocina: no ve la cocina de otro restaurante');
+select tests.claims('authenticated', tests.u('a3'));
+select tests.ok((select customer_phone from public.orders where id = tests.id('o_rec')) = '600 000 000', 'sala: sí ve el teléfono para avisar al cliente');
+reset role;
+
+-- 12.7 Suspensión controlada por la plataforma
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws(format('update public.restaurants set slug = %L where id = %L', 'otra-direccion', tests.piazza()), 'Solo la plataforma', 'owner: no cambia la dirección web (QR)');
+select tests.throws(format('update public.restaurants set suspended_at = now() where id = %L', tests.piazza()), 'Solo la plataforma', 'owner: no suspende su restaurante');
+select tests.throws(format('select public.platform_set_suspension(%L, true, %L)', tests.piazza(), 'prueba'), 'Solo la plataforma', 'owner: no usa la suspensión de la plataforma');
+select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 20 where id = %L', tests.piazza())) = 1, 'owner: cambia la configuración de su restaurante');
+select tests.claims('authenticated', tests.u('a2'));
+select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 30 where id = %L', tests.piazza())) = 0, 'manager: no cambia la configuración del restaurante');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'on9', public.create_order(tests.online(109, 1));
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.throws(format('select public.platform_set_suspension(%L, true, %L)', tests.piazza(), ' '), 'motivo', 'suspender exige un motivo');
+select public.platform_set_suspension(tests.piazza(), true, 'Prueba de impago');
+select public.platform_set_suspension(tests.otro(), true, 'Revisión');
+select tests.ok(tests.affected(format('update public.restaurants set slug = %L where id = %L', 'la-piazza-centro', tests.piazza())) = 1, 'plataforma: cambia la dirección web');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.create_order(%L)', tests.payload(500)), 'no acepta pedidos', 'suspendido: no acepta pedidos');
+select tests.throws(format('select public.customer_switch_to_counter(%L, %L)', tests.id('on9'), tests.tok(109)), 'no acepta pedidos', 'suspendido: no se puede pasar a caja');
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select tests.throws(format('select public.payment_checkout_started(%L, %L, 900)', tests.id('on9'), 'cs_9'), 'no está disponible', 'suspendido: no se abren cobros');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok(tests.affected(format('update public.restaurants set active = false where id = %L', tests.piazza())) = 1, 'owner: puede cerrar su restaurante');
+select tests.ok(tests.affected(format('update public.restaurants set active = true where id = %L', tests.piazza())) = 1, 'owner: puede volver a abrirlo');
+select tests.throws(format('update public.restaurants set suspended_at = null where id = %L', tests.piazza()), 'Solo la plataforma', 'owner: no levanta la suspensión');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.create_order(%L)', tests.payload(501)), 'no acepta pedidos', 'suspendido: abrir el restaurante no basta');
+reset role;
+select tests.claims('authenticated', tests.u('a3'));
+set role authenticated;
+select public.staff_set_prep_status(tests.id('o_rec'), 'en_preparacion');
+reset role;
+select tests.ok((select prep_status = 'en_preparacion' from public.orders where id = tests.id('o_rec')), 'suspendido: el personal termina los pedidos ya hechos');
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select public.platform_set_suspension(tests.piazza(), false, 'Pago recibido');
+select public.platform_set_suspension(tests.otro(), false, '');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.ok((public.create_order(tests.payload(502, jsonb_build_object('items', jsonb_build_array(
+  jsonb_build_object('productId', '5e5e0000-0000-4000-8000-000000000201', 'quantity', 1))))) ->> 'total') = '650', 'reactivado: vuelve a aceptar pedidos');
+reset role;
+
+-- 12.8 Registro de auditoría
+select tests.claims(null, null);
+create function tests.logged(rid uuid, act text) returns boolean language sql as $$
+  select exists (select 1 from private.audit_log where restaurant_id is not distinct from rid and action = act) $$;
+select tests.ok(tests.logged(tests.piazza(), 'personal.alta') and tests.logged(tests.piazza(), 'personal.cambio_funcion')
+  and tests.logged(tests.piazza(), 'personal.baja'), 'auditoría: altas, cambios y bajas de personal');
+select tests.ok(tests.logged(tests.piazza(), 'carta.precio') and tests.logged(tests.piazza(), 'carta.baja_producto'), 'auditoría: cambios de precio y retirada de productos');
+select tests.ok(tests.logged(tests.piazza(), 'pedido.cancelacion') and tests.logged(tests.piazza(), 'pedido.cobro_caja'), 'auditoría: cancelaciones y cobros');
+select tests.ok(tests.logged(tests.piazza(), 'restaurante.suspension') and tests.logged(tests.piazza(), 'restaurante.reactivacion')
+  and tests.logged(tests.piazza(), 'restaurante.slug'), 'auditoría: suspensiones, reactivaciones y dirección web');
+select tests.ok(tests.logged(tests.otro(), 'pago.verificado') and tests.logged(null, 'plataforma.alta_admin'), 'auditoría: pagos verificados y altas de plataforma');
+select tests.ok(exists (select 1 from private.audit_log where action = 'personal.alta' and target_id = tests.u('a5')::text
+  and actor_user_id = tests.u('a1') and actor_kind = 'personal'), 'auditoría: registra quién dio de alta (owner, personal)');
+select tests.ok(exists (select 1 from private.audit_log where action = 'carta.precio' and actor_user_id = tests.u('a2')), 'auditoría: registra quién cambió un precio (manager)');
+select tests.ok(exists (select 1 from private.audit_log where action = 'pedido.cobro_caja' and actor_user_id = tests.u('a3')), 'auditoría: registra quién cobró (sala)');
+select tests.ok(exists (select 1 from private.audit_log where action = 'restaurante.suspension' and actor_user_id = tests.u('ad')
+  and actor_kind = 'plataforma' and details ->> 'motivo' = 'Prueba de impago'), 'auditoría: suspensión con autor y motivo');
+select tests.ok(exists (select 1 from private.audit_log where action = 'pago.verificado' and actor_kind = 'servidor'), 'auditoría: pago verificado por el servidor');
+select tests.ok(exists (select 1 from private.audit_log where action = 'plataforma.consulta_equipo' and actor_user_id = tests.u('ad')
+  and restaurant_id = tests.piazza()), 'auditoría: la plataforma no consulta equipos sin dejar rastro');
+select tests.throws('update private.audit_log set action = $$x$$', 'no se puede modificar', 'auditoría: no se puede modificar');
+select tests.throws('delete from private.audit_log', 'no se puede modificar', 'auditoría: no se puede borrar');
+select tests.throws('truncate private.audit_log', 'no se puede modificar', 'auditoría: no se puede vaciar');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok((select count(*) from public.audit_list(tests.piazza(), 500)) = (select count(*) from public.audit_list(tests.piazza(), 500) where true)
+  and (select count(*) from public.audit_list(tests.piazza(), 500)) > 10, 'owner: lee el registro de su restaurante');
+select tests.ok(not exists (select 1 from public.audit_list(tests.piazza(), 500) where details ->> 'motivo' = 'Revisión'), 'owner: el registro no incluye otros restaurantes');
+select tests.throws('select * from private.audit_log', 'permission denied', 'owner: no lee la tabla del registro directamente');
+select tests.throws(format('select * from public.audit_list(%L, 10)', tests.otro()), 'No tienes acceso', 'owner: no lee el registro de otro restaurante');
+select tests.throws('select * from public.audit_list(null, 10)', 'No tienes acceso', 'owner: no lee el registro de la plataforma');
+select tests.claims('authenticated', tests.u('a2'));
+select tests.throws(format('select * from public.audit_list(%L, 10)', tests.piazza()), 'No tienes acceso', 'manager: no lee el registro');
+select tests.claims('authenticated', tests.u('a4'));
+select tests.throws(format('select * from public.audit_list(%L, 10)', tests.piazza()), 'No tienes acceso', 'cocina: no lee el registro');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.ok((select count(*) from public.audit_list(null, 500)) > 10, 'plataforma: lee el registro completo');
+reset role;
+select tests.ok(exists (select 1 from private.audit_log where action = 'plataforma.consulta_registro' and actor_user_id = tests.u('ad')), 'auditoría: la consulta del registro por la plataforma queda registrada');
+select tests.claims('service_role', null);
+set role service_role;
+select tests.throws('select * from private.audit_log', 'permission denied', 'servidor: no lee la tabla del registro');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select * from public.audit_list(%L, 10)', tests.piazza()), 'permission denied', 'anónimo: no lee el registro');
+reset role;
 
 -- ===================== Resultado =====================
 \o

@@ -43,7 +43,8 @@ export interface ValidatedLine {
 /** Valida un pedido contra la configuración y la carta. Devuelve las líneas con el producto real. */
 export function validateOrder(input: NewOrderInput, restaurant: Restaurant | undefined, products: Product[]) {
   if (!isValidAccessToken(input.accessToken)) fail('Falta el código de seguimiento del pedido');
-  if (!restaurant || !restaurant.active) fail('El restaurante no acepta pedidos en este momento');
+  // Cerrado por el restaurante o suspendido por la plataforma (igual que create_order).
+  if (!restaurant || !restaurant.active || restaurant.suspended) fail('El restaurante no acepta pedidos en este momento');
   const r = restaurant!;
 
   if (input.mode !== 'mesa' && input.mode !== 'recoger') fail('Elige si el pedido es para mesa o para recoger');

@@ -16,9 +16,11 @@ export interface Restaurant {
   /** Tiempo medio de preparación, en minutos. */
   prepMinutes: number;
   createdAt: string;
+  /** Suspendido por la plataforma: no acepta pedidos aunque esté «active». Solo la plataforma lo cambia. */
+  suspended: boolean;
 }
 
-export type NewRestaurantInput = Pick<Restaurant, 'name' | 'slug'> & Partial<Omit<Restaurant, 'id' | 'createdAt'>>;
+export type NewRestaurantInput = Pick<Restaurant, 'name' | 'slug'> & Partial<Omit<Restaurant, 'id' | 'createdAt' | 'suspended'>>;
 
 export interface Category {
   id: string;
@@ -121,6 +123,40 @@ export type StaffRole = 'owner' | 'manager' | 'waiter' | 'kitchen';
 export interface Membership {
   restaurantId: string;
   role: StaffRole;
+}
+
+/** Miembro del equipo de un restaurante (staff_list). */
+export interface StaffMember {
+  userId: string;
+  email: string;
+  role: StaffRole;
+  isMe: boolean;
+}
+
+/** Comanda para cocina: solo lo necesario para preparar (sin teléfono, importes ni pago). */
+export interface KitchenTicket {
+  id: string;
+  number: number;
+  createdAt: string;
+  mode: OrderMode;
+  table: number | null;
+  /** Solo en pedidos para recoger. */
+  customerName: string | null;
+  pickupTime: string | null;
+  notes: string;
+  prepStatus: PrepStatus;
+  items: { name: string; quantity: number; notes?: string }[];
+}
+
+/** Entrada del registro de auditoría (audit_list). */
+export interface AuditEntry {
+  createdAt: string;
+  action: string;
+  actorEmail: string | null;
+  actorKind: 'plataforma' | 'personal' | 'cliente' | 'servidor' | 'sql_editor';
+  targetTable: string | null;
+  targetId: string | null;
+  details: Record<string, unknown>;
 }
 
 export interface StaffSession {

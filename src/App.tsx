@@ -6,7 +6,7 @@ import { configBlocked, isDemo } from './config';
 import { useRestaurants, useSession } from './hooks/useData';
 import { useRoute, type Route } from './hooks/useRoute';
 import { staffGate } from './lib/authRedirect';
-import { can, roleIn, roleLabel } from './lib/permissions';
+import { can, canOpenAdmin, roleIn, roleLabel } from './lib/permissions';
 import { safeStorage } from './lib/storage';
 import { data } from './services';
 import type { StaffRole, StaffSession } from './types';
@@ -34,7 +34,10 @@ function AppContent() {
   const staffView = route.view === 'panel' || route.view === 'cocina' || route.view === 'admin';
   const needsLogin = staffView && data.requiresLogin;
   // En las vistas del personal solo aparecen los restaurantes donde el usuario tiene un rol.
-  const selectable = needsLogin ? restaurants.filter((r) => roleIn(session, r.id)) : restaurants;
+  // La plataforma ve todos los restaurantes solo en Administración (sin acceso operativo).
+  const selectable = needsLogin
+    ? restaurants.filter((r) => roleIn(session, r.id) || (route.view === 'admin' && session?.isPlatformAdmin))
+    : restaurants;
   const selected = selectable.find((r) => r.id === selectedId) ?? selectable[0];
   // El cliente usa el restaurante del enlace/QR si lo hay
   const customerRestaurant = route.view === 'cliente' && route.slug
@@ -62,14 +65,16 @@ function AppContent() {
   else if (route.view === 'admin' && can(session, undefined, 'restaurant.create'))
     body = <AdminView selectedId={selected?.id ?? ''} onSelect={setSelectedId} session={session} />;
   else if (staffView && !selected)
-    body = <div className="page"><Notice>Tu cuenta no tiene ningún restaurante asignado. Pide acceso al administrador de la plataforma.</Notice></div>;
+    body = <div className="page"><Notice>{session?.isPlatformAdmin
+      ? 'Tu cuenta de plataforma no tiene acceso a los pedidos ni a la cocina de los restaurantes. Para intervenir en uno hará falta un acceso de soporte autorizado (fase posterior).'
+      : 'Tu cuenta no tiene ningún restaurante asignado. Pide acceso al administrador de la plataforma.'}</Notice></div>;
   else if (!selected) body = <div className="page"><Notice>No hay restaurantes todavía. Crea uno en Administración.</Notice></div>;
   else if (route.view === 'panel')
     body = can(session, selected.id, 'orders.view') ? <OrdersPanel restaurant={selected} session={session} /> : <NoAccess />;
   else if (route.view === 'cocina')
     body = can(session, selected.id, 'orders.prep') ? <KitchenView restaurant={selected} /> : <NoAccess />;
   else if (route.view === 'admin')
-    body = can(session, selected.id, 'restaurant.edit') ? <AdminView selectedId={selected.id} onSelect={setSelectedId} session={session} /> : <NoAccess />;
+    body = canOpenAdmin(session, selected.id) ? <AdminView selectedId={selected.id} onSelect={setSelectedId} session={session} /> : <NoAccess />;
   else body = <Home restaurant={selected} />;
 
   return (
@@ -118,7 +123,7 @@ function AppBar({ route, restaurants, selectedId, onSelect, customerName, sessio
     if (!session) return true;
     if (n.view === 'panel') return can(session, selectedId, 'orders.view');
     if (n.view === 'cocina') return can(session, selectedId, 'orders.prep');
-    if (n.view === 'admin') return can(session, selectedId, 'restaurant.edit') || session.isPlatformAdmin;
+    if (n.view === 'admin') return canOpenAdmin(session, selectedId) || session.isPlatformAdmin;
     return true;
   });
   return (
