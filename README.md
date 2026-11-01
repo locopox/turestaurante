@@ -122,11 +122,12 @@ supabase/
 
 En el modo demo el soporte no está disponible: necesita cuentas reales de plataforma y de propietario separadas.
 
-### Invitaciones (fase 6 · etapa 1: base de datos)
+### Invitaciones (fase 6 · E1 base de datos y E2 Edge Function)
 
-Solo está hecha la parte de base de datos. La Edge Function que envía los correos (E2) y las pantallas (E3)
-llegarán después: **mientras tanto, «Añadir al equipo» de la app no funciona con Supabase** (ya no existe
-`staff_add_member`).
+Hechas la base de datos (E1) y la Edge Function `invitations` (E2, ver
+[`supabase/functions/invitations/README.md`](supabase/functions/invitations/README.md)), sin desplegar. Las
+pantallas (E3) llegarán después: **mientras tanto, «Añadir al equipo» de la app no funciona con Supabase** (ya no
+existe `staff_add_member`).
 
 - **Nadie tiene permisos antes de aceptar.** La invitación vive en `private.invitations` (no accesible por la API)
   y ninguna comprobación de permisos la lee. El único alta en un equipo es `invitation_accept(id)`, que exige:
@@ -150,8 +151,12 @@ llegarán después: **mientras tanto, «Añadir al equipo» de la app no funcion
 - **Integridad** (también desde el SQL Editor): el historial no se borra, sus datos no cambian, una invitación
   cerrada no se reactiva y una caducada no se acepta. Auditoría de crear, reenviar, aceptar, rechazar, revocar y
   envíos fallidos, con el **correo enmascarado** (`j***@ejemplo.com`).
-- **Solo para el servidor** (futura Edge Function): `invitation_delivery` (incluye si el correo ya tiene cuenta, dato
-  que nunca llega a quien invita) e `invitation_mark_sent`.
+- **Solo para el servidor** (Edge Function): `invitation_delivery` (incluye si el correo ya tiene cuenta y si está
+  confirmada, datos que nunca llegan a quien invita) e `invitation_mark_sent`. Los envíos fallidos quedan en el
+  registro sin restaurante: solo los ve la plataforma (al propietario le revelarían si la persona tenía cuenta).
+- **Edge Function `invitations`**: verifica el JWT, deja que SQL decida los permisos con el JWT de quien invita y usa
+  la clave secreta solo para enviar el correo de Supabase Auth (cuenta nueva o sin confirmar) y anotar el envío. La
+  respuesta y el tiempo de respuesta son los mismos tenga o no cuenta el correo. El enlace vuelve siempre a `APP_URL`.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una

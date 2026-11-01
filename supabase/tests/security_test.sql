@@ -1596,12 +1596,22 @@ select tests.claims('authenticated', tests.u('d1'));
 select tests.ok(public.invitation_accept(tests.id('inv_lote1')) = tests.tercero(), 'sin suspensión: la invitación se acepta');
 reset role;
 
--- 15.14 Funciones del servidor (para la futura Edge Function de envío de correos)
+-- 15.14 Funciones del servidor (para la Edge Function de envío de correos)
+reset role;
+select tests.claims(null, null);
+insert into auth.users (id, email, email_confirmed_at) values (tests.u('d3'), 'sinconfirmar@persona.test', null);
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'inv_sinconf', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'sinconfirmar@persona.test', 'waiter'));
+reset role;
 select tests.claims('service_role', null);
 set role service_role;
 select tests.ok((select not account_exists and state = 'pendiente' and email = 'fantasma@x.test' from public.invitation_delivery(tests.id('r_sin'))),
   'servidor: sabe que el correo no tiene cuenta (para crearla)');
-select tests.ok((select account_exists from public.invitation_delivery(tests.id('r_con'))), 'servidor: sabe que el correo ya tiene cuenta (la verá en la app)');
+select tests.ok((select account_exists and account_confirmed from public.invitation_delivery(tests.id('r_con'))), 'servidor: sabe que el correo ya tiene cuenta confirmada (la verá en la app)');
+select tests.ok((select not account_confirmed from public.invitation_delivery(tests.id('r_sin'))), 'servidor: sin cuenta no hay cuenta confirmada');
+select tests.ok((select account_exists and not account_confirmed from public.invitation_delivery(tests.id('inv_sinconf'))),
+  'servidor: distingue una cuenta invitada que aún no ha confirmado su correo (hay que reenviarle el enlace)');
 select public.invitation_mark_sent(tests.id('r_sin'), 'enviada');
 select public.invitation_mark_sent(tests.id('r_con'), 'no_necesario');
 select public.invitation_mark_sent(tests.id('r_sin'), 'fallida');
@@ -1616,7 +1626,7 @@ select tests.throws(format('select * from public.invitation_delivery(%L)', tests
 -- 15.15 Auditoría (correo enmascarado)
 select tests.ok(tests.logged(tests.piazza(), 'invitacion.creada') and tests.logged(tests.piazza(), 'invitacion.reenviada')
   and tests.logged(tests.piazza(), 'invitacion.aceptada') and tests.logged(tests.piazza(), 'invitacion.rechazada')
-  and tests.logged(tests.piazza(), 'invitacion.revocada') and tests.logged(tests.piazza(), 'invitacion.envio_fallido')
+  and tests.logged(tests.piazza(), 'invitacion.revocada') and tests.logged(null, 'invitacion.envio_fallido')
   and tests.logged(tests.tercero(), 'plataforma.consulta_invitaciones'), 'auditoría: crear, reenviar, aceptar, rechazar, revocar, envío fallido y consultas de la plataforma');
 select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'invitador_sin_permiso')
   and exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'manual'), 'auditoría: el motivo de cada revocación');
@@ -1631,6 +1641,11 @@ select tests.ok(not exists (select 1 from private.audit_log where details::text 
 select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 select tests.ok(exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.creada'), 'owner: ve las invitaciones en su registro');
+select tests.ok(not exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.envio_fallido'),
+  'owner: no ve los envíos fallidos (revelarían si el correo tenía cuenta)');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.ok(exists (select 1 from public.audit_list(null, 500) where action = 'invitacion.envio_fallido' and details ->> 'restaurante' = tests.piazza()::text),
+  'plataforma: ve los envíos fallidos y de qué restaurante son');
 reset role;
 
 -- 15.16 El SQL Editor sigue pudiendo crear restaurantes abiertos (por ejemplo seed.sql)

@@ -2095,11 +2095,14 @@ begin
 end $$;
 
 -- ---------- Solo para el servidor (Edge Function con la clave secreta) ----------
--- Datos para enviar el correo. «account_exists» solo lo ve el servidor (decide si crea la cuenta
--- con inviteUserByEmail o si la persona la verá dentro de la app); nunca llega a quien invita.
+-- Datos para enviar el correo. «account_exists» y «account_confirmed» solo los ve el servidor:
+-- sin cuenta o sin confirmar, la Edge Function envía la invitación de Supabase Auth (que crea la
+-- cuenta o reenvía el enlace); confirmada, la persona la verá dentro de la app. Nunca llegan a
+-- quien invita.
+drop function if exists public.invitation_delivery(uuid);
 create or replace function public.invitation_delivery(p_invitation_id uuid)
 returns table (email text, role public.staff_role, restaurant_name text, expires_at timestamptz,
-  account_exists boolean, state text)
+  account_exists boolean, account_confirmed boolean, state text)
 language plpgsql stable security definer set search_path = '' as $$
 #variable_conflict use_column
 begin
@@ -2109,6 +2112,7 @@ begin
   return query
     select i.email, i.role, r.name, i.expires_at,
       exists (select 1 from auth.users u where lower(u.email::text) = i.email),
+      exists (select 1 from auth.users u where lower(u.email::text) = i.email and u.email_confirmed_at is not null),
       private.invitation_state(i.status, i.expires_at)
     from private.invitations i join public.restaurants r on r.id = i.restaurant_id
     where i.id = p_invitation_id;
@@ -2190,7 +2194,10 @@ begin
     perform private.audit_insert(new.restaurant_id, 'invitacion.' || new.status, 'invitations', new.id::text,
       v_details || jsonb_strip_nulls(jsonb_build_object('motivo', new.closed_reason)));
   elsif new.send_status = 'fallida' and old.send_status is distinct from 'fallida' then
-    perform private.audit_insert(new.restaurant_id, 'invitacion.envio_fallido', 'invitations', new.id::text, v_details);
+    -- Sin restaurante: solo lo ve la plataforma. Un envío solo falla si el correo no tenía cuenta
+    -- confirmada, así que el propietario no debe verlo (revelaría si la persona tiene cuenta).
+    perform private.audit_insert(null, 'invitacion.envio_fallido', 'invitations', new.id::text,
+      v_details || jsonb_build_object('restaurante', new.restaurant_id));
   end if;
   return null;
 end $$;
