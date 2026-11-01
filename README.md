@@ -161,6 +161,9 @@ existe `staff_add_member`).
   responde en cuanto se crea la invitación. El correo se envía después, en segundo plano (`EdgeRuntime.waitUntil`),
   con la clave secreta solo en el servidor; cada llamada recupera además hasta 5 entregas pendientes. La respuesta es
   la misma tenga o no cuenta el correo. El enlace vuelve siempre a `APP_URL`.
+- **Recuperación programada** (`pg_cron` + `pg_net` + Vault, migración `20261105120000`): cada 5 minutos, si hay
+  entregas atrasadas o interrumpidas, la base de datos llama a la Edge Function `invitations-recovery` con un secreto
+  propio guardado en Vault. Configuración, verificación, desactivación y borrado: ver el README de la función.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
@@ -174,6 +177,7 @@ existe `staff_add_member`).
 npm test          # reglas de pedido, modo demo, permisos y variables de entorno (Vitest)
 npm run test:db         # seguridad del SQL y entregas simultáneas: necesita un PostgreSQL LOCAL (no Supabase)
 npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada (PostgreSQL LOCAL)
+npm run test:recovery   # recuperación programada: necesita pg_cron en el PostgreSQL LOCAL (si no, se omite)
 ```
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
@@ -193,7 +197,9 @@ npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada 
 - `supabase/migrations/20261104120000_fase6_invitaciones.sql` (después de la anterior) añade las invitaciones. No
   borra ni modifica datos ni cuentas. **Elimina `staff_add_member`** y quita al servidor la escritura en
   `restaurant_staff` y `platform_admins`.
-- `supabase/migrations_down/` las deshace (primero la de la fase 6, que **borra el historial de invitaciones**,
+- `supabase/migrations/20261105120000_fase6_recuperacion_programada.sql` (después de la anterior, **solo en
+  Supabase**: necesita pg_cron, pg_net y Vault) crea la tarea programada de recuperación. No contiene secretos.
+- `supabase/migrations_down/` las deshace (primero la de la recuperación programada; después la de la fase 6, que **borra el historial de invitaciones**,
   también las pendientes, y conserva a quien ya aceptó; después la de la fase 5, que **borra el registro de consultas
   denegadas**). La de la fase 4 **borra el historial de
   accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y

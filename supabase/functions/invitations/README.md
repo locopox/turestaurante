@@ -207,12 +207,110 @@ npm test                                             # incluye las pruebas de la
 deno check supabase/functions/invitations/index.ts   # si tienes Deno instalado
 ```
 
-## Recuperación sin nuevas invitaciones (pendiente de decisión)
+## Recuperación programada (pg_cron + pg_net + Vault)
 
-Hoy la recuperación se hace **en cada llamada a la función**. Si una entrega queda interrumpida y nadie vuelve a
-invitar a nadie, sigue pendiente hasta la siguiente invitación (o hasta que quien invitó la reenvíe). No se pierde,
-pero puede esperar. Para recuperarla sola haría falta una **tarea programada** (por ejemplo, `pg_cron` + `pg_net` de
-Supabase llamando a la función cada pocos minutos). No está hecha: ver el informe de la etapa.
+Además de la recuperación en cada llamada, una **tarea programada** revisa la cola cada 5 minutos, aunque nadie
+invite a nadie. Archivos:
+
+- `supabase/migrations/20261105120000_fase6_recuperacion_programada.sql` (y su bajada en `migrations_down/`).
+- Edge Function `supabase/functions/invitations-recovery/index.ts` (lógica en `_shared/invitations.ts`).
+
+### Cómo funciona
+
+1. `pg_cron` ejecuta `private.invitations_recovery_tick()` cada 5 minutos (tarea
+   `turestaurante-recuperar-invitaciones`).
+2. Si **no** hay entregas atrasadas o interrumpidas, no llama a nada (anota `sin_pendientes`): no gasta invocaciones.
+3. Si las hay, lee de **Vault** la URL de la función y el secreto compartido, y llama con **pg_net**
+   (`POST`, asíncrono) a `invitations-recovery` con la cabecera `x-turestaurante-recovery: <secreto>`.
+4. La función comprueba el secreto y recupera como mucho 10 entregas con las **mismas** reservas atómicas, intentos
+   (máx. 3), esperas (5 y 30 min) y parada ante el límite de correos que la función de invitaciones. Dos ejecuciones
+   a la vez nunca reservan la misma entrega.
+5. Todo queda anotado: cada ejecución en `private.invitations_recovery_runs` (7 días), la respuesta HTTP (estado y
+   resumen sin datos personales) en `net._http_response` (pg_net la guarda unas horas) y la ejecución de la tarea en
+   `cron.job_run_details`.
+
+### Autenticación de servidor
+
+- La acción de recuperación es **otra** Edge Function: no acepta JWT de usuarios ni peticiones de navegador (con
+  `Origin`), solo `POST` con la cabecera `x-turestaurante-recovery`.
+- El secreto es **propio** (no es la clave secreta de Supabase), de al menos 32 caracteres, y se compara en tiempo
+  constante. La función lo lee de su secreto `INVITATIONS_RECOVERY_SECRET`; la base de datos, de Vault. Sin él, la
+  función no hace nada (500) y la tarea no llama (`sin_configurar`).
+- La tarea solo envía el secreto a una URL `https://…/functions/v1/invitations-recovery` (o `http://` dentro de
+  Supabase local: localhost, host.docker.internal o el contenedor kong).
+- Nadie de la API (anon, authenticated, service_role) puede lanzar la tarea, leer su registro, crear tareas de
+  pg_cron ni leer Vault. El estado lo ven solo las cuentas de plataforma (`invitations_recovery_status` e
+  `invitations_recovery_job`).
+- La función se despliega con `verify_jwt = false` (la tarea no tiene sesión): su protección es el secreto.
+
+### Configurar (cuando se autorice el despliegue)
+
+1. Genera un secreto (por ejemplo `openssl rand -hex 32`). No lo guardes en el repositorio.
+2. Secretos de la función (CLI): `supabase secrets set INVITATIONS_RECOVERY_SECRET=<secreto>` (y `APP_URL`, que ya
+   usa «invitations»). Despliega `invitations-recovery` con `verify_jwt = false`:
+
+   ```toml
+   [functions.invitations-recovery]
+   verify_jwt = false
+   ```
+
+3. Aplica la migración (activa pg_cron y pg_net si no lo están y crea la tarea).
+4. Guarda en Vault la URL y el **mismo** secreto (SQL Editor):
+
+   ```sql
+   select vault.create_secret('https://<ref>.supabase.co/functions/v1/invitations-recovery', 'turestaurante_recovery_url',
+     'URL de la recuperación de invitaciones');
+   select vault.create_secret('<secreto>', 'turestaurante_recovery_secret', 'Secreto de la recuperación de invitaciones');
+   ```
+
+   En Supabase local, la URL vista desde la base de datos suele ser
+   `http://host.docker.internal:54321/functions/v1/invitations-recovery`.
+
+### Verificar que funciona
+
+```sql
+-- Como cuenta de plataforma (desde la app) o en el SQL Editor:
+select * from public.invitations_recovery_job();       -- frecuencia, activa, última ejecución en pg_cron
+select * from public.invitations_recovery_status(20);  -- últimas ejecuciones, estado HTTP y resumen
+-- Solo en el SQL Editor:
+select * from cron.job where jobname = 'turestaurante-recuperar-invitaciones';
+select * from cron.job_run_details where command = 'select private.invitations_recovery_tick()' order by runid desc limit 10;
+```
+
+Qué mirar: `sin_pendientes` cada 5 minutos (la tarea corre), `solicitada` con `http_status` 200 y su resumen
+(`procesadas`, `resultados`); `sin_configurar` (faltan secretos en Vault), `error` (pg_net no pudo encolar), 401 (el
+secreto de Vault y el de la función no coinciden), 500 (falta configurar la función).
+
+### Desactivar, reactivar, eliminar y rotar el secreto
+
+```sql
+-- Desactivar (la tarea queda, pero no se ejecuta):
+select cron.alter_job((select jobid from cron.job where jobname = 'turestaurante-recuperar-invitaciones'), active := false);
+-- Reactivar:
+select cron.alter_job((select jobid from cron.job where jobname = 'turestaurante-recuperar-invitaciones'), active := true);
+-- Eliminar solo la tarea:
+select cron.unschedule('turestaurante-recuperar-invitaciones');
+-- Rotar el secreto: cámbialo a la vez en la función (supabase secrets set …) y en Vault:
+select vault.update_secret((select id from vault.secrets where name = 'turestaurante_recovery_secret'), '<nuevo secreto>');
+-- Borrar los secretos de Vault (si ya no se usan):
+delete from vault.secrets where name in ('turestaurante_recovery_url', 'turestaurante_recovery_secret');
+```
+
+Eliminarlo todo: aplica `supabase/migrations_down/20261105120000_fase6_recuperacion_programada.down.sql` (quita la
+tarea, sus funciones y su registro; no desactiva extensiones ni borra los secretos de Vault). Sin la tarea, las
+entregas pendientes se siguen recuperando en cada llamada a «invitations».
+
+### Pruebas
+
+- `npm run test:recovery`: necesita un PostgreSQL local con **pg_cron real** (`shared_preload_libraries = 'pg_cron'`,
+  `cron.database_name = 'turestaurante_cron'`, `cron.use_background_workers = on`); si no, se omite y lo dice. Si
+  el servidor no tiene pg_net y Vault, usa `supabase/tests/pg_net_vault_stub.sql`, un **sustituto que no es
+  equivalente** (no hace HTTP ni cifra): sirve para probar nuestro SQL, no las extensiones.
+- `RECOVERY_E2E=1 DENO=<ruta a deno> npm run test:recovery` añade una prueba con la Edge Function real en Deno: se le
+  reenvía la petición que preparó la tarea, contra un servidor que imita la API de Supabase y ejecuta las funciones
+  SQL en la base de datos local.
+- Pendiente con Supabase (local o remoto): pg_net enviando de verdad, Vault real, el gateway con `verify_jwt = false`
+  y la ejecución cada 5 minutos en el propio Supabase.
 
 ## Lo que falta por comprobar (E4)
 
@@ -222,3 +320,4 @@ Supabase llamando a la función cada pocos minutos). No está hecha: ver el info
 - Con las claves nuevas de Supabase (`sb_publishable_…` / `sb_secret_…`), confirmar que la función recibe
   `SUPABASE_ANON_KEY` y `SUPABASE_SERVICE_ROLE_KEY` y que `verify_jwt` se comporta como se espera.
 - Que la app (E3) reconozca `type=invite` y pida la contraseña antes de nada.
+- La recuperación programada con pg_cron, pg_net y Vault reales (ver «Pruebas» en la sección anterior).

@@ -1,7 +1,7 @@
 /**
- * Lógica de la Edge Function «invitations» (fase 6). Sin dependencias de Deno ni de npm:
- * index.ts le pasa los clientes de Supabase ya creados. Así se prueba con Vitest y clientes
- * simulados (src/__tests__/invitationsFunction.test.ts).
+ * Lógica de las Edge Functions «invitations» y «invitations-recovery» (fase 6). Sin dependencias
+ * de Deno ni de npm: cada index.ts le pasa los clientes de Supabase ya creados. Así se prueba con
+ * Vitest y clientes simulados (src/__tests__/invitationsFunction.test.ts).
  *
  * Reglas:
  *  - Identidad: el JWT de quien llama se verifica con Supabase Auth (getUser).
@@ -236,72 +236,15 @@ export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) 
     });
   }
 
-  /** Una entrega: reservar → enviar (o no) → anotar. Nunca lanza. */
-  async function deliverOne(invitationId: string): Promise<{ result: FinishResult | 'sin_reserva' | 'error'; rateLimited: boolean }> {
-    let row: ClaimRow | undefined;
-    try {
-      const r = await admin.claim(invitationId);
-      if (r.error) {
-        log('reserva_fallida', { invitationId, code: r.error.code ?? null });
-        return { result: 'error', rateLimited: false };
-      }
-      row = r.data?.[0];
-    } catch {
-      log('reserva_fallida', { invitationId, code: 'excepcion' });
-      return { result: 'error', rateLimited: false };
-    }
-    // Ya enviada, reservada por otro proceso, esperando reintento, cerrada o caducada: nada que hacer.
-    if (!row) return { result: 'sin_reserva', rateLimited: false };
-
-    let outcome: { result: FinishResult; rateLimited: boolean };
-    if (row.account_confirmed) {
-      // Cuenta confirmada: la verá dentro de TuRestaurante (por ahora sin aviso por correo).
-      outcome = { result: 'no_necesario', rateLimited: false };
-    } else {
-      // Sin cuenta: Supabase la crea y envía el enlace. Invitada sin confirmar: Supabase vuelve a
-      // enviar el enlace sin crear otra cuenta. Si el envío falla, Supabase no crea nada.
-      let error: AuthError | null;
-      try {
-        ({ error } = await admin.inviteUserByEmail(row.email, config.appUrl));
-      } catch {
-        error = { status: 0, code: 'red' };
-      }
-      outcome = classifyInviteError(error);
-      if (error && error.code !== 'email_exists') {
-        log('envio_fallido', { invitationId, attempt: row.attempt, status: error.status ?? null, code: error.code ?? null });
-      }
-    }
-    try {
-      const f = await admin.finish(invitationId, row.claim, outcome.result);
-      if (f.error) log('anotacion_fallida', { invitationId, code: f.error.code ?? null });
-      // La reserva caducó y otro proceso la retomó: su resultado manda. (Solo pasa si este proceso
-      // tardó más de 10 minutos.)
-      else if (f.data === false) log('resultado_descartado', { invitationId, attempt: row.attempt });
-    } catch {
-      log('anotacion_fallida', { invitationId, code: 'excepcion' });
-    }
-    log('entrega', { invitationId, attempt: row.attempt, result: outcome.result });
-    return outcome;
-  }
+  const worker = createDeliveryWorker({ admin, appUrl: config.appUrl, log });
 
   /** En segundo plano: la entrega de la invitación recién creada y la recuperación de entregas
    *  atrasadas o interrumpidas (como mucho sweepLimit). Se para si Supabase limita los correos. */
   async function processDeliveries(invitationId: string): Promise<void> {
     try {
-      const first = await deliverOne(invitationId);
+      const first = await worker.deliverOne(invitationId);
       if (first.rateLimited) return;
-      let ids: string[] = [];
-      try {
-        const p = await admin.pending(sweepLimit);
-        if (p.error) log('recuperacion_fallida', { code: p.error.code ?? null });
-        ids = (p.data ?? []).filter((id) => id !== invitationId).slice(0, sweepLimit);
-      } catch {
-        log('recuperacion_fallida', { code: 'excepcion' });
-      }
-      for (const id of ids) {
-        const r = await deliverOne(id);
-        if (r.rateLimited) break;
-      }
+      await worker.sweep(sweepLimit, invitationId);
     } catch {
       log('segundo_plano_fallido', { invitationId });
     }
@@ -379,5 +322,172 @@ export function createInvitationsHandler(deps: InvitationsDeps): (req: Request) 
     //    datos: si esta tarea no llega a terminar, se recupera en otra llamada.
     deps.background(processDeliveries(invitationId));
     return json(200, { ok: true, invitationId, ...(restaurantId ? { restaurantId } : {}), message: INVITATION_MESSAGE }, corsHeaders);
+  };
+}
+
+export type DeliveryOutcome = FinishResult | 'sin_reserva' | 'error';
+
+/** Entregas de correos con la cola persistente de la base de datos (reserva → envío → anotación).
+ *  Lo comparten la función de invitaciones y la de recuperación programada. Nunca lanza. */
+export function createDeliveryWorker(deps: {
+  admin: AdminApi;
+  appUrl: string;
+  log: (event: string, data: Record<string, unknown>) => void;
+}) {
+  const { admin, appUrl, log } = deps;
+
+  /** Una entrega: reservar → enviar (o no) → anotar. */
+  async function deliverOne(invitationId: string): Promise<{ result: DeliveryOutcome; rateLimited: boolean }> {
+    try {
+      let row: ClaimRow | undefined;
+      try {
+        const r = await admin.claim(invitationId);
+        if (r.error) {
+          log('reserva_fallida', { invitationId, code: r.error.code ?? null });
+          return { result: 'error', rateLimited: false };
+        }
+        row = r.data?.[0];
+      } catch {
+        log('reserva_fallida', { invitationId, code: 'excepcion' });
+        return { result: 'error', rateLimited: false };
+      }
+      // Ya enviada, reservada por otro proceso, esperando reintento, cerrada o caducada: nada que hacer.
+      if (!row) return { result: 'sin_reserva', rateLimited: false };
+
+      let outcome: { result: FinishResult; rateLimited: boolean };
+      if (row.account_confirmed) {
+        // Cuenta confirmada: la verá dentro de TuRestaurante (por ahora sin aviso por correo).
+        outcome = { result: 'no_necesario', rateLimited: false };
+      } else {
+        // Sin cuenta: Supabase la crea y envía el enlace. Invitada sin confirmar: Supabase vuelve a
+        // enviar el enlace sin crear otra cuenta. Si el envío falla, Supabase no crea nada.
+        let error: AuthError | null;
+        try {
+          ({ error } = await admin.inviteUserByEmail(row.email, appUrl));
+        } catch {
+          error = { status: 0, code: 'red' };
+        }
+        outcome = classifyInviteError(error);
+        if (error && error.code !== 'email_exists') {
+          log('envio_fallido', { invitationId, attempt: row.attempt, status: error.status ?? null, code: error.code ?? null });
+        }
+      }
+      try {
+        const f = await admin.finish(invitationId, row.claim, outcome.result);
+        if (f.error) log('anotacion_fallida', { invitationId, code: f.error.code ?? null });
+        // La reserva caducó y otro proceso la retomó: su resultado manda. (Solo pasa si este proceso
+        // tardó más de 10 minutos.)
+        else if (f.data === false) log('resultado_descartado', { invitationId, attempt: row.attempt });
+      } catch {
+        log('anotacion_fallida', { invitationId, code: 'excepcion' });
+      }
+      log('entrega', { invitationId, attempt: row.attempt, result: outcome.result });
+      return outcome;
+    } catch {
+      log('entrega_fallida', { invitationId });
+      return { result: 'error', rateLimited: false };
+    }
+  }
+
+  /** Recupera entregas atrasadas o interrumpidas (como mucho `limit`, máximo 10). Se para si
+   *  Supabase limita los correos. Devuelve un resumen sin datos personales. */
+  async function sweep(limit: number, exclude?: string) {
+    const summary = { procesadas: 0, resultados: {} as Record<string, number>, limiteDeCorreos: false, errorDeCola: false };
+    const max = Math.max(1, Math.min(10, Math.floor(limit) || 1));
+    let ids: string[] = [];
+    try {
+      const p = await admin.pending(max);
+      if (p.error) {
+        log('recuperacion_fallida', { code: p.error.code ?? null });
+        summary.errorDeCola = true;
+      }
+      ids = (p.data ?? []).filter((id) => id !== exclude).slice(0, max);
+    } catch {
+      log('recuperacion_fallida', { code: 'excepcion' });
+      summary.errorDeCola = true;
+    }
+    for (const id of ids) {
+      const r = await deliverOne(id);
+      summary.procesadas++;
+      summary.resultados[r.result] = (summary.resultados[r.result] ?? 0) + 1;
+      if (r.rateLimited) {
+        summary.limiteDeCorreos = true;
+        break;
+      }
+    }
+    return summary;
+  }
+
+  return { deliverOne, sweep };
+}
+
+// ---------- Función de recuperación programada («invitations-recovery») ----------
+
+/** Cabecera con el secreto que comparte la tarea programada (pg_cron + pg_net) con la función. */
+export const RECOVERY_HEADER = 'x-turestaurante-recovery';
+export const RECOVERY_SECRET_MIN = 32;
+
+/** Compara dos secretos sin que el tiempo dependa de cuántos caracteres coinciden. */
+export async function sameSecret(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([crypto.subtle.digest('SHA-256', enc.encode(a)), crypto.subtle.digest('SHA-256', enc.encode(b))]);
+  const u = new Uint8Array(x);
+  const v = new Uint8Array(y);
+  let diff = 0;
+  for (let i = 0; i < u.length; i++) diff |= u[i] ^ v[i];
+  return diff === 0;
+}
+
+export interface RecoveryDeps {
+  /** Secreto compartido con la tarea programada (INVITATIONS_RECOVERY_SECRET). null si falta. */
+  secret: string | null;
+  admin: AdminApi;
+  appUrl: string;
+  /** Entregas que recupera cada ejecución (1-10). */
+  limit: number;
+  log?: (event: string, data: Record<string, unknown>) => void;
+}
+
+/**
+ * Acción de recuperación, independiente de las invitaciones normales. Solo la ejecuta quien tenga
+ * el secreto de servidor (la tarea programada de la base de datos lo lee de Supabase Vault). No
+ * acepta JWT de usuarios ni peticiones de navegador. Recupera como mucho `limit` entregas con las
+ * mismas reservas atómicas, intentos y esperas que la función de invitaciones.
+ */
+export function createRecoveryHandler(deps: RecoveryDeps): (req: Request) => Promise<Response> {
+  const log = deps.log ?? (() => {});
+  const worker = createDeliveryWorker({ admin: deps.admin, appUrl: deps.appUrl, log });
+  const reply = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+
+  return async function handle(req: Request): Promise<Response> {
+    // Falla cerrado: sin un secreto suficientemente largo no se ejecuta nada.
+    if (!deps.secret || deps.secret.length < RECOVERY_SECRET_MIN) {
+      log('recuperacion_sin_configurar', {});
+      return reply(500, { ok: false, error: 'La recuperación no está configurada' });
+    }
+    // Ni navegadores (no hay CORS) ni otros métodos.
+    if (req.headers.get('origin')) return reply(403, { ok: false, error: 'No permitido' });
+    if (req.method !== 'POST') return reply(405, { ok: false, error: 'Método no permitido' });
+    const given = req.headers.get(RECOVERY_HEADER) ?? '';
+    if (!given || !(await sameSecret(given, deps.secret))) {
+      log('recuperacion_no_autorizada', {});
+      return reply(401, { ok: false, error: 'No autorizado' });
+    }
+    let body: unknown;
+    try {
+      const text = await req.text();
+      if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) throw new Error();
+      body = JSON.parse(text);
+    } catch {
+      return reply(400, { ok: false, error: 'Petición no válida' });
+    }
+    if (!body || typeof body !== 'object' || (body as Record<string, unknown>).action !== 'recover') {
+      return reply(400, { ok: false, error: 'Acción no válida' });
+    }
+    const summary = await worker.sweep(deps.limit);
+    log('recuperacion', { ...summary });
+    // Resumen sin datos personales: queda en net._http_response para comprobar que funciona.
+    return reply(200, { ok: true, ...summary });
   };
 }

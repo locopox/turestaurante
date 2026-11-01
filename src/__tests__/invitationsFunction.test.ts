@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  classifyInviteError, createInvitationsHandler, INVITATION_MESSAGE, MAX_BODY_BYTES, parseAction, parseAppUrl, parseOrigins,
+  classifyInviteError, createInvitationsHandler, createRecoveryHandler, RECOVERY_HEADER, sameSecret, INVITATION_MESSAGE, MAX_BODY_BYTES, parseAction, parseAppUrl, parseOrigins,
   sqlErrorResponse, type AdminApi, type AuthError, type ClaimRow, type FinishResult, type InvitationsDeps, type RpcResult, type UserRpc,
-} from '../../supabase/functions/invitations/handler';
+} from '../../supabase/functions/_shared/invitations';
 
 // ---------- Cola de entregas simulada (mismas reglas que las funciones SQL invitation_delivery_*) ----------
 const MIN = 60_000;
@@ -509,5 +509,168 @@ describe('invitations: la clave secreta no está en el navegador', () => {
       const text = readFileSync(f, 'utf8');
       expect(text, f).not.toMatch(/SUPABASE_SERVICE_ROLE_KEY|sb_secret_[A-Za-z0-9_-]{8,}|auth\.admin|inviteUserByEmail|invitation_delivery/);
     }
+  });
+});
+
+// ---------- Recuperación programada (función «invitations-recovery») ----------
+const SECRET = 'r'.repeat(20) + 'ecuperacion-secreta-de-prueba-0123456789';
+function recovery(o: { queue?: FakeQueue; invite?: InviteReply[]; secret?: string | null; limit?: number; fail?: Setup['fail'] } = {}) {
+  const q = o.queue ?? new FakeQueue();
+  const calls: { fn: string; args: unknown }[] = [];
+  const logs: { event: string; data: Record<string, unknown> }[] = [];
+  const invites = [...(o.invite ?? [null])];
+  const err = (k: 'claim' | 'finish' | 'pending') => {
+    if (o.fail?.[k] === 'throw') throw new Error('red');
+    return o.fail?.[k] === 'error' ? { code: 'XX000', message: 'fallo' } : null;
+  };
+  const admin: AdminApi = Object.freeze({
+    async claim(id: string) { calls.push({ fn: 'claim', args: id }); const e = err('claim'); return e ? { data: null, error: e } : { data: q.claim(id), error: null }; },
+    async finish(id: string, claim: string, result: FinishResult) { calls.push({ fn: 'finish', args: { id, result } }); const e = err('finish'); return e ? { data: null, error: e } : { data: q.finish(id, claim, result), error: null }; },
+    async pending(limit: number) { calls.push({ fn: 'pending', args: limit }); const e = err('pending'); return e ? { data: null, error: e } : { data: q.pending(limit), error: null }; },
+    async inviteUserByEmail(email: string, redirectTo: string) {
+      calls.push({ fn: 'inviteUserByEmail', args: { email, redirectTo } });
+      const next = invites.length > 1 ? invites.shift()! : invites[0];
+      if (next === 'throw') throw new Error('red');
+      if (next === 'never') return new Promise<{ error: AuthError | null }>(() => {});
+      return { error: next };
+    },
+  });
+  const handle = createRecoveryHandler({ secret: o.secret === undefined ? SECRET : o.secret, admin, appUrl: APP, limit: o.limit ?? 10, log: (event, data) => logs.push({ event, data }) });
+  const run = (headers: Record<string, string> = { [RECOVERY_HEADER]: SECRET }, body: unknown = { action: 'recover' }, method = 'POST') =>
+    handle(new Request('https://fn.test/invitations-recovery', { method, headers, body: method === 'GET' ? undefined : JSON.stringify(body) }));
+  const sentTo = (prefix: string) => calls.filter((c) => c.fn === 'inviteUserByEmail' && (c.args as { email: string }).email.startsWith(prefix)).length;
+  return { q, run, calls, logs, sentTo };
+}
+
+describe('recuperación programada: autenticación de servidor', () => {
+  it('compara el secreto sin atajos (mismo resultado para longitudes distintas)', async () => {
+    expect(await sameSecret(SECRET, SECRET)).toBe(true);
+    expect(await sameSecret(SECRET, SECRET.slice(0, -1) + 'x')).toBe(false);
+    expect(await sameSecret(SECRET, SECRET + 'x')).toBe(false);
+    expect(await sameSecret(SECRET, '')).toBe(false);
+  });
+  it('sin secreto configurado (o demasiado corto): falla cerrado y no toca la cola', async () => {
+    for (const secret of [null, '', 'corto-de-menos-de-32-caracteres']) {
+      const t = recovery({ secret });
+      expect((await t.run()).status).toBe(500);
+      expect(t.calls).toEqual([]);
+    }
+  });
+  it('sin cabecera, con secreto erróneo, con un JWT de usuario o la clave pública: 401 y nada más', async () => {
+    const t = recovery();
+    t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });
+    const attempts: Record<string, string>[] = [{}, { [RECOVERY_HEADER]: 'x' }, { [RECOVERY_HEADER]: SECRET.toUpperCase() },
+      { [RECOVERY_HEADER]: SECRET.slice(0, -1) }, { [RECOVERY_HEADER]: SECRET + 'x' },
+      { authorization: `Bearer ${JWT}` }, { authorization: `Bearer ${SECRET}` }, { apikey: SECRET }];
+    for (const headers of attempts)
+      expect((await t.run(headers)).status).toBe(401);
+    expect(t.calls).toEqual([]);
+    expect(t.q.state(INV)).toBe('sin_enviar/0');
+  });
+  it('navegadores (Origin) y otros métodos: rechazados aunque traigan el secreto', async () => {
+    const t = recovery();
+    expect((await t.run({ [RECOVERY_HEADER]: SECRET, origin: ORIGIN })).status).toBe(403);
+    expect((await t.run({ [RECOVERY_HEADER]: SECRET }, undefined, 'GET')).status).toBe(405);
+    expect((await t.run({ [RECOVERY_HEADER]: SECRET }, { action: 'create', email: 'x@y.z' })).status).toBe(400);
+    expect(t.calls).toEqual([]);
+  });
+  it('los registros no contienen el secreto ni correos', async () => {
+    const t = recovery({ invite: [{ status: 500 }] });
+    t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });
+    await t.run({ [RECOVERY_HEADER]: 'malo' });
+    await t.run();
+    const text = JSON.stringify(t.logs);
+    expect(text).not.toContain(SECRET);
+    expect(text).not.toContain('@');
+  });
+});
+
+describe('recuperación programada: entregas', () => {
+  it('recupera entregas pendientes SIN nuevas invitaciones y devuelve un resumen sin datos personales', async () => {
+    const t = recovery();
+    t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });          // su proceso nunca llegó a reservarla
+    t.q.add(INV2, 'confirmada', { createdAt: t.q.now - 5 * MIN });
+    t.q.add('colgada', 'sin_confirmar'); t.q.claim('colgada'); t.q.now += 11 * MIN; // interrumpida tras reservar
+    const r = await t.run();
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    expect(body).toEqual({ ok: true, procesadas: 3, resultados: { enviada: 2, no_necesario: 1 }, limiteDeCorreos: false, errorDeCola: false });
+    expect(JSON.stringify(body)).not.toContain('@');
+    expect([t.q.state(INV), t.q.state(INV2), t.q.state('colgada')]).toEqual(['enviada/1', 'no_necesario/1', 'enviada/2']);
+    expect(t.calls.filter((c) => c.fn === 'inviteUserByEmail').every((c) => (c.args as { redirectTo: string }).redirectTo === APP)).toBe(true);
+  });
+  it('no toca entregas recién creadas (2 min), en espera de reintento, enviadas ni cerradas', async () => {
+    const t = recovery();
+    t.q.add('fresca', 'nueva');
+    t.q.add('espera', 'nueva', { createdAt: t.q.now - 60 * MIN, attempts: 1, nextAt: t.q.now + 4 * MIN });
+    t.q.add('hecha', 'nueva', { createdAt: t.q.now - 60 * MIN, send: 'enviada', attempts: 1 });
+    t.q.add('revocada', 'nueva', { createdAt: t.q.now - 60 * MIN, status: 'revocada' });
+    const r = await t.run();
+    expect((await r.json()).procesadas).toBe(0);
+    expect(t.calls.some((c) => c.fn === 'inviteUserByEmail')).toBe(false);
+  });
+  it('como mucho `limit` entregas por ejecución (máximo 10), primero las interrumpidas', async () => {
+    const t = recovery({ limit: 4 });
+    for (let i = 0; i < 15; i++) t.q.add(`vieja${String(i).padStart(2, '0')}`, 'nueva', { createdAt: t.q.now - 60 * MIN });
+    t.q.add('colgada', 'nueva'); t.q.claim('colgada'); t.q.now += 11 * MIN;
+    await t.run();
+    expect(t.calls.filter((c) => c.fn === 'pending').map((c) => c.args)).toEqual([4]);
+    expect(t.calls.filter((c) => c.fn === 'inviteUserByEmail').map((c) => (c.args as { email: string }).email.split('@')[0]))
+      .toEqual(['colgada', 'vieja00', 'vieja01', 'vieja02']);
+    const t2 = recovery({ limit: 50 });
+    await t2.run();
+    expect(t2.calls.filter((c) => c.fn === 'pending').map((c) => c.args)).toEqual([10]);
+  });
+  it('reintentos: respeta las esperas (5 y 30 min) y el máximo de 3 intentos aunque se ejecute cada 5 minutos', async () => {
+    const t = recovery({ invite: [{ status: 503 }] });
+    t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });
+    const log: string[] = [];
+    for (let tick = 0; tick < 24; tick++) { // 2 horas de ejecuciones cada 5 minutos
+      await t.run();
+      log.push(t.q.state(INV));
+      t.q.now += 5 * MIN;
+    }
+    expect(t.sentTo(INV)).toBe(3);
+    expect(t.q.state(INV)).toBe('fallida/3');
+    // 1.er intento en la ejecución 0; 2.º tras 5 min (ejecución 1); 3.º tras 30 min más (ejecución 7)
+    expect(log.slice(0, 8)).toEqual(['sin_enviar/1', 'sin_enviar/2', 'sin_enviar/2', 'sin_enviar/2', 'sin_enviar/2', 'sin_enviar/2', 'sin_enviar/2', 'fallida/3']);
+  });
+  it('un fallo temporal no bloquea la cola: la siguiente ejecución tras la espera la envía', async () => {
+    const t = recovery({ invite: [{ status: 500 }, null] });
+    t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });
+    await t.run();
+    expect(t.q.state(INV)).toBe('sin_enviar/1');
+    t.q.now += 5 * MIN;
+    await t.run();
+    expect(t.q.state(INV)).toBe('enviada/2');
+  });
+  it('si la base de datos falla, la ejecución termina y la siguiente lo reintenta', async () => {
+    for (const fail of [{ pending: 'throw' }, { pending: 'error' }, { claim: 'throw' }, { finish: 'error' }] as const) {
+      const t = recovery({ fail });
+      t.q.add(INV, 'nueva', { createdAt: t.q.now - 5 * MIN });
+      const r = await t.run();
+      expect(r.status).toBe(200);
+    }
+    const t = recovery({ fail: { pending: 'error' } });
+    expect((await (await t.run()).json()).errorDeCola).toBe(true);
+  });
+  it('límite de correos de Supabase (429): se detiene la ejecución y las demás esperan', async () => {
+    const t = recovery({ invite: [{ status: 429, code: 'over_email_send_rate_limit' }] });
+    for (let i = 0; i < 5; i++) t.q.add(`p${i}`, 'nueva', { createdAt: t.q.now - 60 * MIN });
+    const body = await (await t.run()).json();
+    expect(body.limiteDeCorreos).toBe(true);
+    expect(t.calls.filter((c) => c.fn === 'inviteUserByEmail')).toHaveLength(1);
+  });
+  it('ejecuciones simultáneas (y una invitación a la vez) no duplican envíos', async () => {
+    const q = new FakeQueue();
+    for (let i = 0; i < 6; i++) q.add(`p${i}`, 'nueva', { createdAt: q.now - 60 * MIN });
+    const a = recovery({ queue: q });
+    const b = recovery({ queue: q });
+    const c = setup({ queue: q });
+    await Promise.all([a.run(), b.run(), a.run(), b.run(), c.post(create)]);
+    await c.flush();
+    for (let i = 0; i < 6; i++) expect(q.state(`p${i}`)).toBe('enviada/1');
+    const total = [...a.calls, ...b.calls, ...c.calls].filter((x) => x.fn === 'inviteUserByEmail' && (x.args as { email: string }).email.startsWith('p'));
+    expect(total).toHaveLength(6);
   });
 });

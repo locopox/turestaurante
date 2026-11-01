@@ -1,5 +1,5 @@
 // Edge Function «invitations» (Deno, Supabase Edge Runtime). Solo crea los clientes y lee la
-// configuración; la lógica está en handler.ts. NO se ejecuta en el navegador: la clave secreta
+// configuración; la lógica está en ../_shared/invitations.ts. NO se ejecuta en el navegador: la clave secreta
 // (SUPABASE_SERVICE_ROLE_KEY) existe solo aquí, en el servidor de Supabase.
 //
 // Variables (Supabase inyecta las tres primeras en sus Edge Functions; APP_URL hay que darla):
@@ -15,7 +15,7 @@ import { createClient } from 'npm:@supabase/supabase-js@2.118.0';
 import {
   createInvitationsHandler, parseAppUrl, parseOrigins,
   type AdminApi, type ClaimRow, type FinishResult, type RpcResult, type UserApi, type UserRpc,
-} from './handler.ts';
+} from '../_shared/invitations.ts';
 
 const env = (k: string) => Deno.env.get(k)?.trim() || undefined;
 const supabaseUrl = env('SUPABASE_URL');
