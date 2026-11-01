@@ -2,7 +2,7 @@ import type { AuthRedirect } from '../lib/authRedirect';
 import type {
   AuditEntry, Category, KitchenTicket, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
   PrepStatus, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant, SupportOrderView,
-  SupportPaymentEventView, SupportRestaurantView,
+  SupportDenial, SupportPaymentEventView, SupportRestaurantView,
 } from '../types';
 
 export interface Menu {
@@ -98,6 +98,8 @@ export interface DataService {
   supportViewRestaurant(restaurantId: string): Promise<SupportRestaurantView>;
   supportViewOrders(restaurantId: string): Promise<SupportOrderView[]>;
   supportViewPaymentEvents(restaurantId: string): Promise<SupportPaymentEventView[]>;
+  /** Intentos de consulta denegados: de un restaurante (su owner) o de toda la plataforma (null). */
+  listSupportDenials(restaurantId: string | null): Promise<SupportDenial[]>;
 
   /**
    * Resultado de la pasarela SIMULADA del modo demo. Con Supabase lanza error: el estado del

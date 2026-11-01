@@ -160,7 +160,24 @@ export interface AuditEntry {
 }
 
 /** Acceso de soporte (solo lectura, 2 horas, aprobado por el propietario). */
-export type SupportStatus = 'pendiente' | 'aprobada' | 'rechazada' | 'revocada' | 'cancelada' | 'caducada';
+export type SupportStatus = 'pendiente' | 'aprobada' | 'rechazada' | 'revocada' | 'cancelada' | 'caducada' | 'solicitud_caducada';
+
+/** Motivo por el que se denegó una consulta de soporte (supabase/schema.sql, support_denial_reason). */
+export type SupportDenialReason =
+  | 'sin_sesion' | 'no_es_plataforma' | 'restaurante_inexistente' | 'sin_solicitud' | 'pendiente' | 'solicitud_caducada'
+  | 'rechazada' | 'revocada' | 'cancelada' | 'caducada' | 'otro_restaurante' | 'limite_superado';
+
+/** Intentos denegados agrupados (los iguales en 10 minutos se cuentan en «attempts»). */
+export interface SupportDenial {
+  firstAt: string;
+  lastAt: string;
+  actorEmail: string | null;
+  actorKind: string;
+  restaurantId: string | null;
+  operation: 'estado' | 'pedidos' | 'avisos_pago' | 'varias';
+  reason: SupportDenialReason;
+  attempts: number;
+}
 
 export interface SupportGrant {
   id: string;

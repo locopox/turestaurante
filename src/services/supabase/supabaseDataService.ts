@@ -2,8 +2,22 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { friendlyAuthError, parseAuthRedirect, PASSWORD_MIN, type AuthRedirect } from '../../lib/authRedirect';
 import type {
   AuditEntry, Category, KitchenTicket, Order, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant,
-  SupportOrderView, SupportPaymentEventView, SupportRestaurantView,
+  SupportDenial, SupportDenialReason, SupportOrderView, SupportPaymentEventView, SupportRestaurantView,
 } from '../../types';
+
+/** Consulta de soporte denegada. La base de datos ya la ha anotado en el registro de denegaciones. */
+export class SupportDeniedError extends Error {
+  constructor(message: string, readonly reason: SupportDenialReason) {
+    super(message);
+  }
+}
+
+/** Respuesta de support_view_*: {ok: true, data} o {ok: false, reason, message}. */
+export function unwrapSupportResponse<T>(r: unknown): T {
+  const res = (r ?? {}) as { ok?: boolean; data?: T; reason?: SupportDenialReason; message?: string };
+  if (res.ok === true) return res.data as T;
+  throw new SupportDeniedError(res.message || 'No tienes un acceso de soporte activo para este restaurante', res.reason ?? 'sin_solicitud');
+}
 import type { DataService, Menu } from '../dataService';
 
 /**
@@ -435,14 +449,20 @@ export class SupabaseDataService implements DataService {
   cancelSupport(grantId: string) {
     return this.rpcVoid('support_cancel', { p_grant_id: grantId });
   }
-  supportViewRestaurant(restaurantId: string) {
-    return this.rpcData<SupportRestaurantView>('support_view_restaurant', { p_restaurant_id: restaurantId });
+  async supportViewRestaurant(restaurantId: string) {
+    return unwrapSupportResponse<SupportRestaurantView>(await this.rpcData('support_view_restaurant', { p_restaurant_id: restaurantId }));
   }
   async supportViewOrders(restaurantId: string) {
-    return (await this.rpcData<SupportOrderView[]>('support_view_orders', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
+    return unwrapSupportResponse<SupportOrderView[]>(await this.rpcData('support_view_orders', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
   }
   async supportViewPaymentEvents(restaurantId: string) {
-    return (await this.rpcData<SupportPaymentEventView[]>('support_view_payment_events', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
+    return unwrapSupportResponse<SupportPaymentEventView[]>(await this.rpcData('support_view_payment_events', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
+  }
+  async listSupportDenials(restaurantId: string | null): Promise<SupportDenial[]> {
+    return ((await this.rpcData<Row[]>('support_denials_list', { p_restaurant_id: restaurantId })) ?? []).map((d) => ({
+      firstAt: d.first_at, lastAt: d.last_at, actorEmail: d.actor_email ?? null, actorKind: d.actor_kind,
+      restaurantId: d.restaurant_id ?? null, operation: d.operation, reason: d.reason, attempts: d.attempts,
+    }));
   }
 
   async listAudit(restaurantId: string | null): Promise<AuditEntry[]> {

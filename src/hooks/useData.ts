@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { data, type Menu } from '../services';
-import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession, SupportGrant } from '../types';
+import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession, SupportDenial, SupportGrant } from '../types';
 
 interface Loadable<T> {
   value: T | undefined;
@@ -76,6 +76,10 @@ export const useAudit = (restaurantId: string | null) =>
 /** Solicitudes de soporte de un restaurante (propietario). */
 export const useSupportRequests = (restaurantId: string, enabled: boolean) =>
   useLoad<SupportGrant[]>(() => (enabled ? data.listSupportRequests(restaurantId) : Promise.resolve([])), null, [restaurantId, enabled]);
+
+/** Intentos de consulta de soporte denegados (owner: su restaurante · plataforma: null = todos). */
+export const useSupportDenials = (restaurantId: string | null, enabled: boolean) =>
+  useLoad<SupportDenial[]>(() => (enabled ? data.listSupportDenials(restaurantId) : Promise.resolve([])), null, [restaurantId, enabled]);
 
 /** Solicitudes de soporte propias (plataforma). */
 export const useMySupportRequests = (enabled: boolean) =>

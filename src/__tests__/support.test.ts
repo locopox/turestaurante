@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { auditActionLabel } from '../lib/audit';
 import { can } from '../lib/permissions';
-import { isSupportActive, remainingLabel } from '../lib/support';
-import { SupabaseDataService } from '../services/supabase/supabaseDataService';
+import { denialReasonLabel, denialSummary, isSupportActive, remainingLabel, supportStatusLabel } from '../lib/support';
+import { SupabaseDataService, SupportDeniedError, unwrapSupportResponse } from '../services/supabase/supabaseDataService';
 import type { StaffRole, StaffSession } from '../types';
 
 vi.stubGlobal('BroadcastChannel', undefined);
@@ -58,8 +58,9 @@ describe('modo soporte: servicio de Supabase (cliente simulado)', () => {
     } as unknown as SupabaseClient;
     return { svc: new SupabaseDataService('https://x.supabase.co', 'sb_publishable_x', { createClient: async () => client, env: null }), calls };
   }
+  const ok = { ok: true, data: [] };
   it('cada operación usa su función SQL (nunca tablas)', async () => {
-    const { svc, calls } = service();
+    const { svc, calls } = service({ support_view_orders: ok, support_view_payment_events: ok, support_view_restaurant: { ok: true, data: {} } });
     await svc.requestSupport('A', '  Pedidos que no llegan  ');
     await svc.decideSupport('g1', true);
     await svc.revokeSupport('g1');
@@ -85,11 +86,62 @@ describe('modo soporte: servicio de Supabase (cliente simulado)', () => {
   });
 });
 
+describe('modo soporte: caducidad de solicitudes y consultas denegadas', () => {
+  function service(results: Record<string, unknown>) {
+    const calls: { fn: string; args: unknown }[] = [];
+    const client = {
+      auth: { onAuthStateChange: () => ({ data: { subscription: { unsubscribe() {} } } }) },
+      rpc: async (fn: string, args: unknown) => { calls.push({ fn, args }); return { data: results[fn] ?? null, error: null }; },
+    } as unknown as SupabaseClient;
+    return { svc: new SupabaseDataService('https://x.supabase.co', 'sb_publishable_x', { createClient: async () => client, env: null }), calls };
+  }
+  it('la solicitud caducada (24 h) se distingue del acceso caducado (2 h) y nunca está activa', () => {
+    expect(supportStatusLabel.solicitud_caducada).toMatch(/24 h/);
+    expect(supportStatusLabel.caducada).toMatch(/2 h/);
+    expect(isSupportActive({ status: 'solicitud_caducada', expiresAt: null }, Date.now())).toBe(false);
+  });
+  it('una consulta permitida devuelve solo los datos', async () => {
+    const { svc } = service({ support_view_orders: { ok: true, data: [{ id: 'o1' }] } });
+    expect(await svc.supportViewOrders('A')).toEqual([{ id: 'o1' }]);
+  });
+  it('una consulta denegada lanza un error con el motivo y no devuelve datos', async () => {
+    for (const reason of ['pendiente', 'solicitud_caducada', 'revocada', 'caducada', 'otro_restaurante', 'sin_solicitud'] as const) {
+      const { svc } = service({ support_view_orders: { ok: false, reason, message: `motivo ${reason}` } });
+      const err = await svc.supportViewOrders('A').catch((e) => e);
+      expect(err).toBeInstanceOf(SupportDeniedError);
+      expect(err.reason).toBe(reason);
+      expect(err.message).toBe(`motivo ${reason}`);
+    }
+  });
+  it('una respuesta sin «ok: true» nunca se trata como permitida', () => {
+    for (const r of [null, undefined, {}, { data: [1] }, { ok: 'true', data: [1] }, { ok: false, data: [1] }])
+      expect(() => unwrapSupportResponse(r)).toThrow(SupportDeniedError);
+  });
+  it('lista los intentos denegados con su función SQL y los convierte', async () => {
+    const { svc, calls } = service({ support_denials_list: [{ first_at: 'a', last_at: 'b', actor_email: 'p@x', actor_kind: 'plataforma',
+      restaurant_id: 'A', operation: 'pedidos', reason: 'revocada', attempts: 3 }] });
+    expect(await svc.listSupportDenials('A')).toEqual([{ firstAt: 'a', lastAt: 'b', actorEmail: 'p@x', actorKind: 'plataforma',
+      restaurantId: 'A', operation: 'pedidos', reason: 'revocada', attempts: 3 }]);
+    await svc.listSupportDenials(null);
+    expect(calls).toEqual([
+      { fn: 'support_denials_list', args: { p_restaurant_id: 'A' } },
+      { fn: 'support_denials_list', args: { p_restaurant_id: null } },
+    ]);
+  });
+  it('describe cada motivo y resume los intentos', () => {
+    for (const r of ['sin_sesion', 'no_es_plataforma', 'restaurante_inexistente', 'sin_solicitud', 'pendiente', 'solicitud_caducada',
+      'rechazada', 'revocada', 'cancelada', 'caducada', 'otro_restaurante', 'limite_superado'] as const) expect(denialReasonLabel[r]).toBeTruthy();
+    expect(denialSummary({ attempts: 1, operation: 'estado' })).toBe('1 intento de consultar estado del restaurante');
+    expect(denialSummary({ attempts: 5, operation: 'pedidos' })).toBe('5 intentos de consultar pedidos');
+  });
+});
+
 describe('modo soporte en la demo', () => {
   it('no está disponible (requiere cuentas reales separadas)', async () => {
     const svc = new MockDataService();
     await expect(svc.requestSupport()).rejects.toThrow('Supabase');
     await expect(svc.supportViewOrders()).rejects.toThrow('Supabase');
     expect(await svc.mySupportRequests()).toEqual([]);
+    expect(await svc.listSupportDenials(null)).toEqual([]);
   });
 });

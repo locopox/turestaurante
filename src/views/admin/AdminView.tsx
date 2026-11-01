@@ -4,11 +4,11 @@ import { ART_OPTIONS, FoodArt } from '../../components/FoodArt';
 import { useToast } from '../../components/Toast';
 import { Badge, Icon, Modal, Notice, Spinner } from '../../components/ui';
 import { config, onlinePaymentsAvailable } from '../../config';
-import { useAudit, useMenu, useMySupportRequests, useNow, useOrders, useRestaurants, useStaff, useSupportRequests } from '../../hooks/useData';
+import { useAudit, useMenu, useMySupportRequests, useNow, useOrders, useRestaurants, useStaff, useSupportDenials, useSupportRequests } from '../../hooks/useData';
 import { hrefFor } from '../../hooks/useRoute';
 import { auditActionLabel, auditActor, auditDetails } from '../../lib/audit';
 import { formatPrice, formatTime, orderCode, paymentLabel, prepLabel, slugify } from '../../lib/format';
-import { isSupportActive, remainingLabel, supportStatusLabel } from '../../lib/support';
+import { denialReasonLabel, denialSummary, isSupportActive, remainingLabel, supportStatusLabel } from '../../lib/support';
 import { data } from '../../services';
 import { can, canOpenAdmin, manageableRoles, roleLabel } from '../../lib/permissions';
 import type {
@@ -628,7 +628,31 @@ function SupportOwnerPanel({ restaurant }: { restaurant: Restaurant }) {
         <h3 className="card__title">Historial</h3>
         <SupportHistory grants={past} />
       </section>
+      <SupportDenials restaurantId={restaurant.id} />
     </div>
+  );
+}
+
+/** Intentos de consulta denegados (sin datos de clientes): quién, cuándo, qué y por qué. */
+function SupportDenials({ restaurantId }: { restaurantId: string | null }) {
+  const { value: denials = [], loading, error } = useSupportDenials(restaurantId, true);
+  return (
+    <section className="card">
+      <h3 className="card__title">Intentos de acceso denegados</h3>
+      <p className="muted small">Los intentos iguales en 10 minutos se agrupan y se cuentan.</p>
+      {error && <Notice tone="danger">{error}</Notice>}
+      {loading && !denials.length ? <Spinner /> : !denials.length ? <p className="muted small">Ninguno.</p> : (
+        <ul className="audit">
+          {denials.map((d, i) => (
+            <li key={i} className="audit__row">
+              <span className="muted small mono">{new Date(d.lastAt).toLocaleString('es-ES')}</span>
+              <strong>{denialReasonLabel[d.reason] ?? d.reason}</strong>
+              <span className="small">{d.actorEmail ?? d.actorKind} · {denialSummary(d)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -705,6 +729,7 @@ function SupportRequestPanel({ restaurant }: { restaurant: Restaurant }) {
         <h3 className="card__title">Mis solicitudes para este restaurante</h3>
         <SupportHistory grants={grants.filter((g) => g !== active && g !== pending)} />
       </section>
+      <SupportDenials restaurantId={restaurant.id} />
     </div>
   );
 }

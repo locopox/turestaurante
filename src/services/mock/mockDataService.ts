@@ -1,7 +1,7 @@
 import { createSeed, type SeedDB } from '../../data/seed';
 import { canChangePrep, OrderRuleError, validateOrder } from '../../lib/orderRules';
 import { safeStorage, uid } from '../../lib/storage';
-import type { KitchenTicket, Order, PaymentStatus, Restaurant, StaffSession } from '../../types';
+import type { KitchenTicket, Order, PaymentStatus, Restaurant, StaffSession, SupportDenial } from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 const KEY = 'turestaurante:demo-db:v1';
@@ -342,6 +342,10 @@ export class MockDataService implements DataService {
   }
   async supportViewPaymentEvents(): Promise<never> {
     throw new Error(NO_SUPPORT);
+  }
+  async listSupportDenials(_restaurantId: string | null): Promise<SupportDenial[]> {
+    void _restaurantId;
+    return [];
   }
   async setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string) {
     if (suspended && reason.trim().length < 3) throw new Error('Indica el motivo de la suspensión');

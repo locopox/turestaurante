@@ -106,6 +106,18 @@ supabase/
    precios, cobros, productos, equipo ni configuración.
 6. Queda registrado quién pide, quién aprueba o rechaza, inicio y caducidad, cada consulta (qué datos), y quién
    revoca o cancela. El propietario lo ve en Administración → Registro. El historial de accesos no se puede borrar.
+7. **Una solicitud sin respuesta caduca a las 24 horas** de crearse («Caducada sin respuesta (24 h)»). Ya no se
+   puede aprobar, rechazar ni reactivar (lo impide también un trigger, incluso desde el SQL Editor); la plataforma
+   tiene que pedir otra. Un acceso aprobado sigue durando 2 horas desde la aprobación y se puede revocar al momento.
+8. **Los intentos de consulta denegados quedan registrados** (sin acceso, solicitud pendiente o caducada, acceso
+   revocado/caducado, otro restaurante…): quién, qué restaurante, cuándo, qué consulta y el motivo. Las funciones
+   `support_view_*` no lanzan error al denegar: devuelven `{ok: false, reason, message}`, así la anotación no se
+   deshace. No se guardan contraseñas, tokens ni datos de clientes. Los intentos iguales en 10 minutos se agrupan
+   en una fila con un contador, y cada cuenta tiene un máximo de 50 filas por ventana (el resto se suma en una fila
+   «Demasiados intentos»), para que nadie pueda llenar la tabla. Nadie puede escribir, modificar ni borrar el
+   registro directamente (está en el esquema `private` y protegido por trigger). Lo ven el propietario (solo su
+   restaurante, en Administración → Soporte) y la plataforma (`support_denials_list`). Las llamadas sin sesión
+   (`anon`) no llegan a ejecutarse, así que no se anotan.
 
 En el modo demo el soporte no está disponible: necesita cuentas reales de plataforma y de propietario separadas.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
@@ -120,7 +132,7 @@ En el modo demo el soporte no está disponible: necesita cuentas reales de plata
 ```bash
 npm test          # reglas de pedido, modo demo, permisos y variables de entorno (Vitest)
 npm run test:db         # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase)
-npm run test:migration  # migración de la fase 3: subida, repetición y bajada (PostgreSQL LOCAL)
+npm run test:migration  # migraciones fases 3 a 5: subida, repetición y bajada (PostgreSQL LOCAL)
 ```
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
@@ -134,10 +146,14 @@ npm run test:migration  # migración de la fase 3: subida, repetición y bajada 
   de la rama `fase2-recuperar-contrasena`. No borra datos.
 - `supabase/migrations/20261102120000_fase4_modo_soporte.sql` (después de la anterior) añade el modo soporte.
   No borra datos ni modifica objetos existentes.
-- `supabase/migrations_down/` las deshace (primero la de la fase 4). La de la fase 4 **borra el historial de
+- `supabase/migrations/20261103120000_fase5_soporte_caducidad_registro.sql` (después de la anterior) añade la
+  caducidad de 24 h de las solicitudes y el registro de consultas denegadas. No borra datos. **Cambia la respuesta
+  de `support_view_*`** a `{ok, data}`: hay que desplegar a la vez la versión de la app de esta rama.
+- `supabase/migrations_down/` las deshace (primero la de la fase 5; esta **borra el registro de consultas
+  denegadas**). La de la fase 4 **borra el historial de
   accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y
   las suspensiones**.
-- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 es idéntica a una
+- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 es idéntica a una
   instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
 
 Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
