@@ -591,8 +591,13 @@ select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.
 select tests.throws(format('select public.staff_mark_paid_at_counter(%L)', tests.id('o1')), 'no encontrado', 'plataforma: no registra cobros');
 select tests.ok(tests.affected(format('update public.products set price_cents = 1 where restaurant_id = %L', tests.piazza())) = 0, 'plataforma: no cambia precios');
 select tests.throws(format('insert into public.categories (restaurant_id, name) values (%L, %L)', tests.piazza(), 'X'), 'row-level security', 'plataforma: no crea categorías');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin@plataforma.test', 'owner'), 'propio acceso', 'plataforma: no puede añadirse a un restaurante');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin2@plataforma.test', 'owner'), 'plataforma no pueden ser personal', 'plataforma: no puede añadir a otra cuenta de plataforma');
+-- (fase 6) Invitar a una cuenta de plataforma no revela nada: se crea, pero no se puede aceptar.
+insert into tests.vars select 'inv_admin2', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'admin2@plataforma.test', 'owner'));
+select tests.ok(tests.id('inv_admin2') is not null, 'plataforma: invitar a otra cuenta de plataforma responde igual que con cualquier correo');
+select tests.claims('authenticated', tests.u('ae'));
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_admin2')), 'plataforma no pueden ser personal', 'plataforma: otra cuenta de plataforma no puede aceptar ser personal');
+select tests.claims('authenticated', tests.u('ad'));
+select public.invitation_revoke(tests.id('inv_admin2'));
 reset role;
 select tests.claims(null, null);
 select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), tests.u('ae'), 'owner'), 'plataforma no pueden ser personal', 'SQL Editor: una cuenta de plataforma no puede ser personal');
@@ -602,12 +607,19 @@ select tests.throws(format('insert into public.platform_admins (user_id) values 
 select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 4 and (select bool_or(is_me and role = 'owner') from public.staff_list(tests.piazza())), 'owner: ve su equipo con emails');
-select public.staff_add_member(tests.piazza(), 'nuevo@piazza.test', 'waiter');
-select public.staff_add_member(tests.piazza(), '  MAYUS@piazza.TEST ', 'kitchen');
-select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 6, 'owner: da de alta sala y cocina (email sin distinguir mayúsculas)');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes asignar esa función', 'owner: no puede nombrar propietarios');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'nadie@piazza.test', 'waiter'), 'No hay ninguna cuenta', 'owner: email sin cuenta');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'nuevo@piazza.test', 'kitchen'), 'ya forma parte', 'owner: no duplica miembros');
+-- (fase 6) Las altas son por invitación: la persona invitada la acepta con su cuenta.
+insert into tests.vars select 'inv_a5', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'nuevo@piazza.test', 'waiter'));
+insert into tests.vars select 'inv_a8', jsonb_build_object('id', public.invitation_create(tests.piazza(), '  MAYUS@piazza.TEST ', 'kitchen'));
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 4, 'owner: invitar no da de alta a nadie todavía');
+select tests.claims('authenticated', tests.u('a5'));
+select public.invitation_accept(tests.id('inv_a5'));
+select tests.claims('authenticated', tests.u('a8'));
+select public.invitation_accept(tests.id('inv_a8'));
+select tests.claims('authenticated', tests.u('a1'));
+select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 6, 'owner: sala y cocina entran al aceptar (email sin distinguir mayúsculas)');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes invitar a esa función', 'owner: no puede nombrar propietarios');
+select tests.ok(public.invitation_create(tests.piazza(), 'nadie@piazza.test', 'waiter') is not null, 'owner: invitar a un correo sin cuenta responde igual (no revela si existe)');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'nuevo@piazza.test', 'kitchen'), 'ya forma parte', 'owner: no duplica miembros');
 select public.staff_change_role(tests.piazza(), tests.u('a5'), 'manager');
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a1'), 'manager'), 'propio acceso', 'owner: no cambia su propio rol');
 select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a1')), 'propio acceso', 'owner: no se quita a sí mismo');
@@ -619,12 +631,15 @@ select tests.throws(format('insert into public.platform_admins (user_id) values 
 -- 12.3 Gestión de equipo: manager (solo sala y cocina)
 select tests.claims('authenticated', tests.u('a2'));
 select tests.ok((select count(*) from public.staff_list(tests.piazza())) = 6, 'manager: ve su equipo');
-select public.staff_add_member(tests.piazza(), 'extra@piazza.test', 'kitchen');
+insert into tests.vars select 'inv_a6', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'extra@piazza.test', 'kitchen'));
+select tests.claims('authenticated', tests.u('a6'));
+select public.invitation_accept(tests.id('inv_a6'));
+select tests.claims('authenticated', tests.u('a2'));
 select tests.ok(exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test' and role = 'kitchen'), 'manager: da de alta cocina');
 select public.staff_change_role(tests.piazza(), tests.u('a6'), 'waiter');
 select tests.ok(exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test' and role = 'waiter'), 'manager: cambia cocina ↔ sala');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'manager'), 'No puedes asignar esa función', 'manager: no nombra encargados');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes asignar esa función', 'manager: no nombra propietarios');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'manager'), 'No puedes invitar a esa función', 'manager: no nombra encargados');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'No puedes invitar a esa función', 'manager: no nombra propietarios');
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a6'), 'manager'), 'No puedes asignar esa función', 'manager: no asciende a encargado');
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a6'), 'owner'), 'No puedes asignar esa función', 'manager: no asciende a propietario');
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a2'), 'owner'), 'propio acceso', 'manager: no se asciende a sí mismo');
@@ -633,12 +648,12 @@ select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.pi
 select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a5')), 'No puedes gestionar a esa persona', 'manager: no quita a otro encargado');
 select public.staff_remove_member(tests.piazza(), tests.u('a6'));
 select tests.ok(not exists (select 1 from public.staff_list(tests.piazza()) where email = 'extra@piazza.test'), 'manager: retira el acceso a sala/cocina');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.otro(), 'socio@piazza.test', 'waiter'), 'No puedes asignar esa función', 'manager: no gestiona otro restaurante');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.otro(), 'socio@piazza.test', 'waiter'), 'No puedes invitar a esa función', 'manager: no gestiona otro restaurante');
 
 -- 12.4 Sala, cocina, usuarios sin rol y otros restaurantes no gestionan equipos
 select tests.claims('authenticated', tests.u('a3'));
 select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'sala: no ve la lista del equipo');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'kitchen'), 'No puedes asignar esa función', 'sala: no da de alta a nadie');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'kitchen'), 'No puedes invitar a esa función', 'sala: no invita a nadie');
 select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a4')), 'No puedes gestionar a esa persona', 'sala: no quita a nadie');
 select tests.claims('authenticated', tests.u('a4'));
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a4'), 'owner'), 'propio acceso', 'cocina: no se asciende');
@@ -646,7 +661,7 @@ select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.
 select tests.throws(format('select public.platform_set_suspension(%L, false, %L)', tests.piazza(), ''), 'Solo la plataforma', 'cocina: no toca la suspensión');
 select tests.claims('authenticated', tests.u('b1'));
 select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'otro restaurante: no ve el equipo de La Piazza');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'waiter'), 'No puedes asignar esa función', 'otro restaurante: no da de alta en La Piazza');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'waiter'), 'No puedes invitar a esa función', 'otro restaurante: no invita a La Piazza');
 select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a3')), 'No puedes gestionar a esa persona', 'otro restaurante: no quita personal de La Piazza');
 select tests.claims('authenticated', tests.u('b2'));
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a3'), 'kitchen'), 'No puedes gestionar a esa persona', 'manager de otro restaurante: no gestiona La Piazza');
@@ -654,7 +669,8 @@ select tests.claims('authenticated', tests.u('ee'));
 select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'sin rol: no ve equipos');
 select tests.claims('anon', null);
 set role anon;
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'permission denied', 'anónimo: no puede gestionar equipos');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'socio@piazza.test', 'owner'), 'permission denied', 'anónimo: no puede invitar');
+select tests.throws(format('select public.invitation_accept(%L)', gen_random_uuid()), 'permission denied', 'anónimo: no puede aceptar invitaciones');
 reset role;
 
 -- 12.5 Último propietario y propietarios gestionados por la plataforma
@@ -663,7 +679,14 @@ set role authenticated;
 select tests.ok((select count(*) from public.staff_list(tests.piazza())) >= 5, 'plataforma: ve el equipo (consulta registrada)');
 select tests.throws(format('select public.staff_remove_member(%L, %L)', tests.piazza(), tests.u('a1')), 'al menos un propietario', 'plataforma: no quita al último propietario');
 select tests.throws(format('select public.staff_change_role(%L, %L, %L)', tests.piazza(), tests.u('a1'), 'manager'), 'al menos un propietario', 'plataforma: no degrada al último propietario');
-select public.staff_add_member(tests.piazza(), 'socio@piazza.test', 'owner');
+insert into tests.vars select 'inv_a7', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'socio@piazza.test', 'owner'));
+reset role;
+select tests.claims('authenticated', tests.u('a7'));
+set role authenticated;
+select public.invitation_accept(tests.id('inv_a7'));
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
 select tests.ok((select count(*) from public.staff_list(tests.piazza()) where role = 'owner') = 2, 'plataforma: nombra un segundo propietario');
 reset role;
 select tests.claims('authenticated', tests.u('a1'));
@@ -723,7 +746,8 @@ reset role;
 select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 select tests.ok(tests.affected(format('update public.restaurants set active = false where id = %L', tests.piazza())) = 1, 'owner: puede cerrar su restaurante');
-select tests.ok(tests.affected(format('update public.restaurants set active = true where id = %L', tests.piazza())) = 1, 'owner: puede volver a abrirlo');
+-- (fase 6) Un restaurante suspendido no se puede volver a abrir desde la app.
+select tests.throws(format('update public.restaurants set active = true where id = %L', tests.piazza()), 'suspendido no se puede activar', 'owner: no reabre su restaurante mientras está suspendido');
 select tests.throws(format('update public.restaurants set suspended_at = null where id = %L', tests.piazza()), 'Solo la plataforma', 'owner: no levanta la suspensión');
 reset role;
 select tests.claims('anon', null);
@@ -739,6 +763,10 @@ select tests.claims('authenticated', tests.u('ad'));
 set role authenticated;
 select public.platform_set_suspension(tests.piazza(), false, 'Pago recibido');
 select public.platform_set_suspension(tests.otro(), false, '');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok(tests.affected(format('update public.restaurants set active = true where id = %L', tests.piazza())) = 1, 'owner: reabre su restaurante cuando deja de estar suspendido');
 reset role;
 select tests.claims('anon', null);
 set role anon;
@@ -757,8 +785,11 @@ select tests.ok(tests.logged(tests.piazza(), 'pedido.cancelacion') and tests.log
 select tests.ok(tests.logged(tests.piazza(), 'restaurante.suspension') and tests.logged(tests.piazza(), 'restaurante.reactivacion')
   and tests.logged(tests.piazza(), 'restaurante.slug'), 'auditoría: suspensiones, reactivaciones y dirección web');
 select tests.ok(tests.logged(tests.otro(), 'pago.verificado') and tests.logged(null, 'plataforma.alta_admin'), 'auditoría: pagos verificados y altas de plataforma');
-select tests.ok(exists (select 1 from private.audit_log where action = 'personal.alta' and target_id = tests.u('a5')::text
-  and actor_user_id = tests.u('a1') and actor_kind = 'personal'), 'auditoría: registra quién dio de alta (owner, personal)');
+-- (fase 6) El owner invita y la persona entra al aceptar: constan las dos cosas, cada una con su autor.
+select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.creada' and target_id = tests.id('inv_a5')::text
+  and actor_user_id = tests.u('a1') and actor_kind = 'personal')
+  and exists (select 1 from private.audit_log where action = 'personal.alta' and target_id = tests.u('a5')::text
+  and actor_user_id = tests.u('a5')), 'auditoría: registra quién invitó (owner) y quién aceptó y entró');
 select tests.ok(exists (select 1 from private.audit_log where action = 'carta.precio' and actor_user_id = tests.u('a2')), 'auditoría: registra quién cambió un precio (manager)');
 select tests.ok(exists (select 1 from private.audit_log where action = 'pedido.cobro_caja' and actor_user_id = tests.u('a3')), 'auditoría: registra quién cobró (sala)');
 select tests.ok(exists (select 1 from private.audit_log where action = 'restaurante.suspension' and actor_user_id = tests.u('ad')
@@ -862,7 +893,7 @@ select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.
 select tests.throws(format('select public.staff_mark_paid_at_counter(%L)', tests.id('o_rec')), 'no encontrado', 'soporte: no registra cobros');
 select tests.ok(tests.affected(format('update public.products set price_cents = 1 where restaurant_id = %L', tests.piazza())) = 0, 'soporte: no cambia precios');
 select tests.throws(format('insert into public.categories (restaurant_id, name) values (%L, %L)', tests.piazza(), 'X'), 'row-level security', 'soporte: no crea productos ni categorías');
-select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin@plataforma.test', 'owner'), 'propio acceso', 'soporte: no se convierte en personal');
+select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), tests.u('ad'), 'owner'), 'permission denied', 'soporte: no se convierte en personal');
 select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: no puede ampliar ni reaprobar su acceso');
 -- Aislamiento: el acceso es solo para ese restaurante y esa cuenta
 select tests.ok((public.support_view_orders(tests.otro()) ->> 'ok') = 'false', 'soporte: el acceso de La Piazza no sirve para otro restaurante');
@@ -1172,6 +1203,440 @@ select tests.throws(format('select * from public.support_denials_list(%L)', test
 select tests.claims('authenticated', tests.u('ad'));
 select tests.ok(exists (select 1 from public.support_denials_list(null) where reason = 'limite_superado'), 'plataforma: ve todos los intentos, incluido el límite');
 reset role;
+
+-- ===================== 15. CUENTAS E INVITACIONES (FASE 6) =====================
+reset role;
+select tests.claims(null, null);
+-- Estado visible de una invitación (las pruebas la leen como postgres).
+create function tests.inv_state(iid uuid) returns text language sql security definer as $$
+  select private.invitation_state(status, expires_at) from private.invitations where id = iid
+$$;
+-- ¿Puede «inviter» invitar a la función r en rid? Lo intenta y lo deshace (no deja rastro ni cuenta en los límites).
+create function tests.can_invite(inviter uuid, rid uuid, r public.staff_role) returns text language plpgsql as $$
+begin
+  perform tests.claims('authenticated', inviter);
+  begin
+    perform public.invitation_create(rid, 'matriz-' || r::text || '@x.test', r);
+    raise exception 'tests_deshacer';
+  exception when others then
+    return case when sqlerrm = 'tests_deshacer' then 'si' else 'no: ' || sqlerrm end;
+  end;
+end $$;
+create function tests.tercero() returns uuid language sql stable as $$
+  select (val ->> 'restaurantId')::uuid from tests.vars where key = 'tercero'
+$$;
+-- Cuentas: c2 ya trabaja en «Otro Sitio» (cocina); c3 tiene cuenta y ningún restaurante; el resto se
+-- crean más abajo, como haría Supabase Auth al invitar (sin confirmar hasta pulsar el enlace).
+insert into auth.users (id, email) values
+  (tests.u('c2'), 'doble@persona.test'), (tests.u('c3'), 'intruso@persona.test'), (tests.u('c6'), 'caducada@persona.test'),
+  (tests.u('c8'), 'rechaza@persona.test'), (tests.u('c9'), 'sala2@persona.test'), (tests.u('c4'), 'reenvio2@persona.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values (tests.otro(), tests.u('c2'), 'kitchen');
+
+-- 15.1 Nadie toca las invitaciones ni el equipo directamente
+select tests.ok(to_regprocedure('public.staff_add_member(uuid,text,public.staff_role)') is null, 'staff_add_member ya no existe (no hay altas sin invitación)');
+select tests.ok((select pronargs from pg_proc where proname = 'invitation_accept') = 1, 'aceptar solo recibe la invitación: la función concedida no se elige');
+select tests.ok(not exists (select 1 from pg_proc where proname in ('invitation_list', 'my_invitations', 'invitation_create')
+  and array_to_string(coalesce(proargnames, '{}'), ',') ~* 'account|exist|user_id'), 'las funciones del personal no devuelven si un correo tiene cuenta');
+select tests.ok(not exists (select 1 from pg_proc where proname = 'my_invitations' and array_to_string(proargnames, ',') ~* 'email'),
+  'mis invitaciones no muestran el correo de quien invita');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws('select * from private.invitations', 'permission denied', 'personal: no lee la tabla de invitaciones');
+select tests.throws(format('insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at) values (%L, %L, %L, %L, now())',
+  tests.piazza(), 'x@x.test', 'owner', 'plataforma'), 'permission denied', 'personal: no crea invitaciones directamente');
+select tests.throws(format('select private.invitation_insert(%L, %L, %L, null, 0)', tests.piazza(), 'x@x.test', 'owner'), 'permission denied', 'personal: no usa las funciones internas');
+select tests.throws(format('select * from public.invitation_delivery(%L)', gen_random_uuid()), 'permission denied', 'personal: no ve los datos de envío (si existe la cuenta)');
+select tests.throws(format('select public.invitation_mark_sent(%L, %L)', gen_random_uuid(), 'enviada'), 'permission denied', 'personal: no anota envíos');
+reset role;
+select tests.claims('service_role', null);
+set role service_role;
+select tests.throws(format('insert into public.restaurant_staff (restaurant_id, user_id, role) values (%L, %L, %L)', tests.piazza(), tests.u('c3'), 'owner'),
+  'permission denied', 'servidor (clave secreta): no da de alta personal sin invitación');
+select tests.throws(format('update public.restaurant_staff set role = %L where user_id = %L', 'owner', tests.u('a3')), 'permission denied', 'servidor: no cambia funciones directamente');
+select tests.throws(format('delete from public.restaurant_staff where user_id = %L', tests.u('a3')), 'permission denied', 'servidor: no quita personal saltándose las reglas');
+select tests.throws(format('insert into public.platform_admins (user_id) values (%L)', tests.u('c3')), 'permission denied', 'servidor: no crea cuentas de plataforma');
+select tests.throws('select * from private.invitations', 'permission denied', 'servidor: no lee la tabla de invitaciones');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'x@x.test', 'owner'), 'permission denied', 'servidor: no invita en nombre de nadie');
+reset role;
+
+-- 15.2 La plataforma crea un restaurante y su primer propietario
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws($$select public.platform_create_restaurant('Tercer Sitio', 'tercer-sitio', 'dueno@tercero.test')$$, 'Solo la plataforma', 'owner: no crea restaurantes');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.throws($$select public.platform_create_restaurant('Tercer Sitio', 'tercer-sitio', 'no-es-un-correo')$$, 'correo del propietario no es válido', 'plataforma: el correo del propietario debe ser válido');
+select tests.ok(not exists (select 1 from public.restaurants where slug = 'tercer-sitio'), 'plataforma: con un correo no válido no se crea el restaurante');
+insert into tests.vars select 'tercero', public.platform_create_restaurant('Tercer Sitio', 'tercer-sitio', '  Dueno@Tercero.test ');
+select tests.ok((select not active from public.restaurants where id = tests.tercero()), 'restaurante nuevo: nace cerrado');
+select tests.ok((select count(*) from public.staff_list(tests.tercero())) = 0, 'restaurante nuevo: sin personal hasta que se acepte la invitación');
+select tests.ok(exists (select 1 from public.invitation_list(tests.tercero()) where role = 'owner' and state = 'pendiente'
+  and email = 'dueno@tercero.test' and invited_by_label like 'TuRestaurante%'), 'restaurante nuevo: invitación de propietario pendiente (correo normalizado)');
+select tests.throws(format('update public.restaurants set active = true where id = %L', tests.tercero()), 'hasta que su propietario acepte', 'plataforma: no lo abre sin propietario');
+select tests.throws($$insert into public.restaurants (slug, name, active) values ('abierto-sin-dueno', 'Abierto sin dueño', true)$$, 'hasta que su propietario acepte', 'plataforma: no crea restaurantes abiertos sin propietario');
+select tests.throws($$select public.platform_create_restaurant('Repetido', 'tercer-sitio', 'otro@tercero.test')$$, 'duplicate key|slug', 'plataforma: dirección web repetida');
+reset role;
+select tests.claims(null, null);
+-- Supabase Auth crea la cuenta al invitar (inviteUserByEmail), SIN confirmar hasta que se pulsa el enlace.
+insert into auth.users (id, email, email_confirmed_at) values (tests.u('c5'), 'dueno@tercero.test', null);
+select tests.claims('authenticated', tests.u('c5'));
+set role authenticated;
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'cuenta sin confirmar: no ve invitaciones');
+select tests.throws(format('select public.invitation_accept(%L)', (tests.v('tercero') ->> 'invitationId')), 'Confirma tu correo', 'cuenta sin confirmar: no puede aceptar');
+select tests.ok((select count(*) from public.my_memberships()) = 0, 'antes de aceptar: no pertenece a ningún restaurante');
+select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 30 where id = %L', tests.tercero())) = 0, 'antes de aceptar: no cambia la configuración');
+select tests.throws(format('select * from public.invitation_list(%L)', tests.tercero()), 'No tienes acceso', 'antes de aceptar: no ve las invitaciones');
+select tests.throws(format('select public.kitchen_orders(%L)', tests.tercero()), 'No tienes acceso', 'antes de aceptar: no ve la cocina');
+reset role;
+update auth.users set email_confirmed_at = now() where id = tests.u('c5');  -- pulsa el enlace del correo
+select tests.claims('authenticated', tests.u('c5'));
+set role authenticated;
+select tests.ok((select count(*) from public.my_invitations() where restaurant_name = 'Tercer Sitio' and role = 'owner'
+  and invited_by_label like 'TuRestaurante%') = 1, 'cuenta nueva confirmada: ve su invitación');
+select tests.ok(public.invitation_accept((tests.v('tercero') ->> 'invitationId')::uuid) = tests.tercero(), 'cuenta nueva: acepta y entra como propietario');
+select tests.ok(exists (select 1 from public.my_memberships() where restaurant_id = tests.tercero() and role = 'owner'), 'cuenta nueva: es propietaria de ese restaurante');
+select tests.throws(format('select public.invitation_accept(%L)', (tests.v('tercero') ->> 'invitationId')), 'Ya aceptaste', 'una invitación no se acepta dos veces');
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'la invitación aceptada desaparece de la lista');
+select tests.ok(tests.affected(format('update public.restaurants set active = true where id = %L', tests.tercero())) = 1, 'con propietario: ya se puede abrir');
+select tests.throws(format('select * from public.staff_list(%L)', tests.piazza()), 'No tienes acceso', 'el nuevo propietario no ve otros restaurantes');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.tercero(), 'socio@tercero.test', 'owner'), 'No puedes invitar a esa función', 'el propietario no invita a copropietarios');
+reset role;
+
+-- 15.3 Matriz: quién puede invitar a qué función (La Piazza)
+set role authenticated;
+select tests.ok(tests.can_invite(tests.u(x.who), tests.piazza(), x.r::public.staff_role) like x.expect || '%',
+  format('matriz La Piazza: %s → %s: %s', x.label, x.r, x.expect), tests.can_invite(tests.u(x.who), tests.piazza(), x.r::public.staff_role))
+from (values
+  ('ad', 'plataforma', 'owner', 'si'), ('ad', 'plataforma', 'manager', 'si'), ('ad', 'plataforma', 'waiter', 'si'), ('ad', 'plataforma', 'kitchen', 'si'),
+  ('a1', 'owner', 'owner', 'no'), ('a1', 'owner', 'manager', 'si'), ('a1', 'owner', 'waiter', 'si'), ('a1', 'owner', 'kitchen', 'si'),
+  ('a2', 'manager', 'owner', 'no'), ('a2', 'manager', 'manager', 'no'), ('a2', 'manager', 'waiter', 'si'), ('a2', 'manager', 'kitchen', 'si'),
+  ('a3', 'sala', 'owner', 'no'), ('a3', 'sala', 'manager', 'no'), ('a3', 'sala', 'waiter', 'no'), ('a3', 'sala', 'kitchen', 'no'),
+  ('a4', 'cocina', 'owner', 'no'), ('a4', 'cocina', 'manager', 'no'), ('a4', 'cocina', 'waiter', 'no'), ('a4', 'cocina', 'kitchen', 'no'),
+  ('b1', 'owner de Otro Sitio', 'owner', 'no'), ('b1', 'owner de Otro Sitio', 'manager', 'no'), ('b1', 'owner de Otro Sitio', 'waiter', 'no'), ('b1', 'owner de Otro Sitio', 'kitchen', 'no'),
+  ('b2', 'manager de Otro Sitio', 'waiter', 'no'), ('b2', 'manager de Otro Sitio', 'kitchen', 'no'),
+  ('c5', 'owner de Tercer Sitio', 'waiter', 'no'), ('ee', 'sin rol', 'waiter', 'no'), ('ee', 'sin rol', 'owner', 'no')
+) x(who, label, r, expect);
+select tests.ok(tests.can_invite(tests.u('b1'), tests.otro(), 'manager') = 'si' and tests.can_invite(tests.u('b1'), tests.otro(), 'owner') like 'no%',
+  'matriz Otro Sitio: su owner invita encargados, no propietarios');
+reset role;
+select tests.claims(null, null);
+select tests.ok(not exists (select 1 from private.invitations where email like 'matriz-%'), 'matriz: los intentos no dejan invitaciones');
+
+-- 15.4 Una cuenta en dos restaurantes, con permisos independientes; al salir de uno conserva el otro
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'inv_doble', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'doble@persona.test', 'waiter'));
+select tests.claims('authenticated', tests.u('c2'));
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.piazza()) = 0, 'invitada sin aceptar: no ve pedidos del restaurante');
+select tests.throws(format('select public.kitchen_orders(%L)', tests.piazza()), 'No tienes acceso', 'invitada sin aceptar: no ve su cocina');
+select tests.throws(format('select public.staff_mark_paid_at_counter(%L)', tests.id('o1')), 'no encontrado', 'invitada sin aceptar: no cobra');
+select tests.ok((select count(*) from public.my_memberships()) = 1, 'invitada sin aceptar: solo pertenece a su restaurante');
+select tests.ok(exists (select 1 from public.my_invitations() where id = tests.id('inv_doble') and invited_by_label like 'Equipo de %'),
+  'cuenta existente: ve la invitación dentro de la app');
+select public.invitation_accept(tests.id('inv_doble'));
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.piazza()) > 0, 'cuenta existente: tras aceptar ve los pedidos de La Piazza (sala)');
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.otro()) = 0, 'cuenta existente: en Otro Sitio sigue siendo cocina (no ve pedidos)');
+select tests.ok((select count(*) from jsonb_array_elements(public.kitchen_orders(tests.otro()))) >= 0, 'cuenta existente: conserva su cocina de Otro Sitio');
+select tests.ok((select count(*) from public.my_memberships()) = 2 and exists (select 1 from public.my_memberships() where restaurant_id = tests.otro() and role = 'kitchen')
+  and exists (select 1 from public.my_memberships() where restaurant_id = tests.piazza() and role = 'waiter'), 'cuenta existente: dos restaurantes con funciones distintas');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.otro(), 'x@x.test', 'waiter'), 'No puedes invitar', 'ser sala en un restaurante no da permisos en el otro');
+select tests.claims('authenticated', tests.u('a1'));
+select public.staff_remove_member(tests.piazza(), tests.u('c2'));
+select tests.claims('authenticated', tests.u('c2'));
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.piazza()) = 0, 'al salir: pierde al instante el acceso a ese restaurante');
+select tests.ok((select count(*) from public.my_memberships()) = 1 and exists (select 1 from public.my_memberships() where restaurant_id = tests.otro()),
+  'al salir: conserva su cuenta y su acceso al otro restaurante');
+reset role;
+select tests.ok(exists (select 1 from auth.users where id = tests.u('c2')), 'al salir: la cuenta no se elimina');
+
+-- 15.5 Quien invita no sabe si el correo tiene cuenta, ni dónde
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'r_sin', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'fantasma@x.test', 'waiter'));
+insert into tests.vars select 'r_con', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'intruso@persona.test', 'waiter'));
+insert into tests.vars select 'r_otro', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'kitchen@otro.test', 'waiter'));
+insert into tests.vars select 'r_plat', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'admin@plataforma.test', 'waiter'));
+select tests.ok(tests.id('r_sin') is not null and tests.id('r_con') is not null and tests.id('r_otro') is not null and tests.id('r_plat') is not null,
+  'misma respuesta: sin cuenta, con cuenta, de otro restaurante o de la plataforma');
+select tests.ok((select count(distinct (state, can_manage, invited_by_label, resend_count)) from public.invitation_list(tests.piazza())
+  where email in ('fantasma@x.test', 'intruso@persona.test', 'kitchen@otro.test', 'admin@plataforma.test')) = 1,
+  'la lista de quien invita es idéntica en los cuatro casos');
+
+-- 15.6 Solo la persona invitada acepta, con su correo
+select tests.claims('authenticated', tests.u('c3'));
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('r_sin')), 'no existe o no es para tu cuenta', 'otra cuenta: no acepta una invitación ajena');
+select tests.throws(format('select public.invitation_decline(%L)', tests.id('r_sin')), 'no existe o no es para tu cuenta', 'otra cuenta: no rechaza una invitación ajena');
+select tests.throws(format('select public.invitation_accept(%L)', gen_random_uuid()), 'no existe o no es para tu cuenta', 'invitación inexistente: mismo mensaje (no se puede sondear)');
+select tests.ok((select array_agg(id) from public.my_invitations()) = array[tests.id('r_con')], 'cada cuenta ve solo sus invitaciones');
+select tests.claims('authenticated', tests.u('b4'));
+select public.invitation_accept(tests.id('r_otro'));
+select tests.ok(exists (select 1 from public.my_memberships() where restaurant_id = tests.piazza() and role = 'waiter')
+  and exists (select 1 from public.my_memberships() where restaurant_id = tests.otro() and role = 'kitchen'), 'personal de otro restaurante: acepta y queda en los dos');
+select tests.ok(tests.affected(format('update public.restaurants set prep_minutes = 25 where id = %L', tests.piazza())) = 0, 'ser sala no permite cambiar la configuración');
+select tests.throws(format('select * from public.invitation_list(%L)', tests.piazza()), 'No tienes acceso', 'sala: no ve las invitaciones');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'cuenta de plataforma: no ve invitaciones para ser personal');
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('r_plat')), 'plataforma no pueden ser personal', 'cuenta de plataforma: no puede aceptar');
+reset role;
+
+-- 15.7 Caducadas (7 días): no se aceptan, no se rechazan, no se reenvían, no se reactivan
+select tests.claims(null, null);
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+  select tests.piazza(), 'caducada@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours'
+  from (select now() - interval '7 days 1 minute' as t) x returning id)
+insert into tests.vars select 'inv_cad', jsonb_build_object('id', id) from i;
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+  select tests.piazza(), 'casi@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours'
+  from (select now() - interval '6 days 23 hours' as t) x returning id)
+insert into tests.vars select 'inv_casi', jsonb_build_object('id', id) from i;
+select tests.ok(tests.inv_state(tests.id('inv_cad')) = 'caducada' and tests.inv_state(tests.id('inv_casi')) = 'pendiente', 'caduca a los 7 días exactos (6 d 23 h sigue pendiente)');
+select tests.claims('authenticated', tests.u('c6'));
+set role authenticated;
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'caducada: no aparece');
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_cad')), 'ha caducado', 'caducada: no se puede aceptar');
+select tests.throws(format('select public.invitation_decline(%L)', tests.id('inv_cad')), 'ha caducado', 'caducada: no se puede rechazar');
+select tests.claims('authenticated', tests.u('a1'));
+select tests.ok(exists (select 1 from public.invitation_list(tests.piazza()) where id = tests.id('inv_cad') and state = 'caducada' and not can_manage),
+  'caducada: quien invita la ve como caducada');
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_cad')), 'ha caducado. Crea una nueva', 'caducada: no se reenvía');
+insert into tests.vars select 'inv_cad2', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'caducada@persona.test', 'waiter'));
+reset role;
+select tests.ok(tests.inv_state(tests.id('inv_cad')) = 'reemplazada' and tests.inv_state(tests.id('inv_cad2')) = 'pendiente', 'caducada: la plataforma o el equipo crean una nueva y la antigua queda reemplazada');
+select tests.throws(format('update private.invitations set status = %L, decided_at = null where id = %L', 'pendiente', tests.id('inv_cad')),
+  'cerrada no se puede reactivar', 'SQL Editor: una invitación cerrada no se reactiva');
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+  select tests.piazza(), 'vieja@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours'
+  from (select now() - interval '8 days' as t) x returning id)
+insert into tests.vars select 'inv_cad3', jsonb_build_object('id', id) from i;
+select tests.throws(format('update private.invitations set status = %L, decided_at = now() where id = %L', 'aceptada', tests.id('inv_cad3')),
+  'ha caducado', 'SQL Editor: una caducada no se acepta');
+select tests.claims('authenticated', tests.u('c6'));
+set role authenticated;
+select tests.ok(public.invitation_accept(tests.id('inv_cad2')) = tests.piazza(), 'tras caducar, la invitación nueva sí se acepta');
+reset role;
+select tests.claims(null, null);
+-- Integridad (también desde el SQL Editor)
+select tests.throws(format($$insert into private.invitations (restaurant_id, email, role, invited_by_kind, created_at, expires_at)
+  values (%L, 'futuro@x.test', 'waiter', 'personal', now() + interval '1 day', now() + interval '8 days')$$, tests.piazza()), 'fecha futura', 'SQL Editor: sin fechas futuras');
+select tests.throws(format($$insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at, status, decided_at)
+  values (%L, 'ya@x.test', 'waiter', 'personal', now() + interval '168 hours', 'aceptada', now())$$, tests.piazza()), 'empieza pendiente', 'SQL Editor: una invitación nace pendiente');
+select tests.throws(format($$insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at)
+  values (%L, 'larga@x.test', 'waiter', 'personal', now() + interval '30 days')$$, tests.piazza()), 'invitations_seven_days', 'SQL Editor: no se amplía la caducidad');
+select tests.throws(format($$insert into private.invitations (restaurant_id, email, role, invited_by_kind, expires_at)
+  values (%L, 'Mal Correo', 'waiter', 'personal', now() + interval '168 hours')$$, tests.piazza()), 'check constraint', 'SQL Editor: correo no válido o sin normalizar');
+select tests.throws(format('update private.invitations set email = %L where id = %L', 'otra@x.test', tests.id('inv_casi')), 'no se pueden modificar', 'SQL Editor: no cambia el correo');
+select tests.throws(format('update private.invitations set role = %L where id = %L', 'owner', tests.id('inv_casi')), 'no se pueden modificar', 'SQL Editor: no cambia la función');
+select tests.throws(format('update private.invitations set expires_at = expires_at + interval %L where id = %L', '1 day', tests.id('inv_casi')), 'no se pueden modificar', 'SQL Editor: no amplía una invitación');
+select tests.throws(format('delete from private.invitations where id = %L', tests.id('inv_casi')), 'no se puede borrar', 'SQL Editor: no borra invitaciones');
+select tests.throws('truncate private.invitations cascade', 'no se puede borrar', 'SQL Editor: no vacía el historial');
+
+-- 15.8 Reenvíos: 5 minutos de espera, como mucho 3, y solo quien puede dar esa función
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'inv_re', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'reenvio@persona.test', 'waiter'));
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_re')), 'Espera al menos 5 minutos', 'reenvío: espera de 5 minutos');
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.piazza(), 'reenvio@persona.test', 'kitchen'), 'Ya hay una invitación pendiente', 'una sola invitación pendiente por correo y restaurante');
+insert into tests.vars select 'inv_mgr', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'encargado@persona.test', 'manager'));
+reset role;
+select tests.claims(null, null);
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+  select tests.piazza(), 'reenvio2@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours'
+  from (select now() - interval '10 minutes' as t) x returning id)
+insert into tests.vars select 'inv_re2', jsonb_build_object('id', id) from i;
+-- Una cadena que ya lleva 3 reenvíos
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+  select tests.piazza(), 'reenvio3@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours'
+  from (select now() - interval '30 minutes' as t) x returning id)
+insert into tests.vars select 'inv_re3a', jsonb_build_object('id', id) from i;
+update private.invitations set status = 'reemplazada', decided_at = now() where id = tests.id('inv_re3a');
+with i as (
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at, replaces, resend_count)
+  select tests.piazza(), 'reenvio3@persona.test', 'waiter', tests.u('a1'), 'personal', t, t + interval '168 hours', tests.id('inv_re3a'), 3
+  from (select now() - interval '10 minutes' as t) x returning id)
+insert into tests.vars select 'inv_re3', jsonb_build_object('id', id) from i;
+select tests.claims('authenticated', tests.u('a2'));
+set role authenticated;
+insert into tests.vars select 'inv_re2b', jsonb_build_object('id', public.invitation_resend(tests.id('inv_re2')));
+select tests.ok(exists (select 1 from public.invitation_list(tests.piazza()) where id = tests.id('inv_re2b') and state = 'pendiente'
+  and resend_count = 1 and expires_at > now() + interval '6 days 23 hours'), 'reenvío: invitación nueva con 7 días más (manager, sala)');
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_re3')), 'reenviado 3 veces', 'reenvío: como mucho 3 veces');
+select tests.ok(exists (select 1 from public.invitation_list(tests.piazza()) where id = tests.id('inv_mgr') and not can_manage)
+  and exists (select 1 from public.invitation_list(tests.piazza()) where id = tests.id('inv_re') and can_manage)
+  and exists (select 1 from public.invitation_list(tests.piazza()) where role = 'owner'),
+  'manager: ve todas las invitaciones y solo gestiona las de sala y cocina');
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_mgr')), 'No puedes gestionar esa invitación', 'manager: no reenvía la invitación de un encargado');
+select tests.throws(format('select public.invitation_revoke(%L)', tests.id('inv_mgr')), 'No puedes gestionar esa invitación', 'manager: no revoca la invitación de un encargado');
+select tests.claims('authenticated', tests.u('b1'));
+select tests.throws(format('select public.invitation_revoke(%L)', tests.id('inv_re')), 'No puedes gestionar esa invitación', 'otro restaurante: no revoca invitaciones de La Piazza');
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_re')), 'No puedes gestionar esa invitación', 'otro restaurante: no reenvía invitaciones de La Piazza');
+select tests.throws(format('select * from public.invitation_list(%L)', tests.piazza()), 'No tienes acceso', 'otro restaurante: no ve las invitaciones de La Piazza');
+select tests.claims('authenticated', tests.u('a3'));
+select tests.throws(format('select public.invitation_revoke(%L)', tests.id('inv_re')), 'No puedes gestionar esa invitación', 'sala: no revoca invitaciones');
+select tests.claims('authenticated', tests.u('c4'));
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_re2')), 'ya no está disponible', 'reenvío: la invitación anterior ya no sirve');
+select tests.ok(public.invitation_accept(tests.id('inv_re2b')) = tests.piazza(), 'reenvío: la nueva sí se acepta');
+reset role;
+
+-- 15.9 Rechazadas
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'inv_rech', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'rechaza@persona.test', 'kitchen'));
+select tests.claims('authenticated', tests.u('c8'));
+select public.invitation_decline(tests.id('inv_rech'));
+select tests.ok((select count(*) from public.my_memberships()) = 0, 'rechazada: no da ningún permiso');
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_rech')), 'ya no está disponible', 'rechazada: ya no se puede aceptar');
+select tests.throws(format('select public.invitation_decline(%L)', tests.id('inv_rech')), 'ya no está disponible', 'rechazada: no se rechaza dos veces');
+select tests.claims('authenticated', tests.u('a1'));
+select tests.ok(exists (select 1 from public.invitation_list(tests.piazza()) where id = tests.id('inv_rech') and state = 'rechazada'), 'rechazada: quien invita lo ve');
+select tests.throws(format('select public.invitation_revoke(%L)', tests.id('inv_rech')), 'ya no está pendiente', 'rechazada: no se revoca');
+insert into tests.vars select 'inv_rech2', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'rechaza@persona.test', 'kitchen'));
+select tests.claims('authenticated', tests.u('c8'));
+select tests.ok(public.invitation_accept(tests.id('inv_rech2')) = tests.piazza(), 'rechazada: una invitación nueva posterior sí se acepta');
+reset role;
+
+-- 15.10 Revocadas
+select tests.claims('authenticated', tests.u('a2'));
+set role authenticated;
+insert into tests.vars select 'inv_rev', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'sala2@persona.test', 'waiter'));
+select public.invitation_revoke(tests.id('inv_rev'));
+select tests.throws(format('select public.invitation_revoke(%L)', tests.id('inv_rev')), 'ya no está pendiente', 'revocada: no se revoca dos veces');
+select tests.throws(format('select public.invitation_resend(%L)', tests.id('inv_rev')), 'ya no está pendiente', 'revocada: no se reenvía');
+select tests.claims('authenticated', tests.u('c9'));
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'revocada: desaparece para la persona invitada');
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_rev')), 'ya no está disponible', 'revocada: no se puede aceptar');
+select tests.ok((select count(*) from public.my_memberships()) = 0, 'revocada: no da ningún permiso');
+reset role;
+
+-- 15.11 Si quien invitó pierde el permiso (cambio de función, baja, cuenta eliminada), su invitación deja de valer
+select tests.claims('authenticated', tests.u('a2'));
+set role authenticated;
+insert into tests.vars select 'inv_tras', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'tras@persona.test', 'kitchen'));
+select tests.claims('authenticated', tests.u('a1'));
+select public.staff_change_role(tests.piazza(), tests.u('a2'), 'waiter');
+reset role;
+select tests.ok((select status = 'revocada' and closed_reason = 'invitador_sin_permiso' from private.invitations where id = tests.id('inv_tras')),
+  'manager degradado: sus invitaciones pendientes se revocan');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select public.staff_change_role(tests.piazza(), tests.u('a2'), 'manager');
+reset role;
+select tests.claims(null, null);
+insert into auth.users (id, email) values (tests.u('c7'), 'temporal@piazza.test'), (tests.u('d2'), 'hu@persona.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values (tests.piazza(), tests.u('c7'), 'manager');
+select tests.claims('authenticated', tests.u('c7'));
+set role authenticated;
+insert into tests.vars select 'inv_temp', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'hu@persona.test', 'waiter'));
+reset role;
+select tests.claims(null, null);
+delete from auth.users where id = tests.u('c7');  -- se elimina la cuenta de quien invitó
+select tests.ok((select status = 'revocada' and invited_by is null from private.invitations where id = tests.id('inv_temp')),
+  'cuenta eliminada: se puede eliminar y sus invitaciones quedan revocadas');
+select tests.ok(exists (select 1 from private.audit_log where action = 'personal.baja' and target_id = tests.u('c7')::text), 'cuenta eliminada: su baja queda registrada');
+select tests.claims('authenticated', tests.u('d2'));
+set role authenticated;
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_temp')), 'ya no está disponible', 'cuenta eliminada: su invitación no se puede aceptar');
+reset role;
+select tests.claims(null, null);
+insert into public.platform_admins (user_id) values (tests.u('ae'));  -- segunda cuenta de plataforma (se retiró en la sección 13)
+select tests.claims('authenticated', tests.u('ae'));
+set role authenticated;
+insert into tests.vars select 'inv_plat', jsonb_build_object('id', public.invitation_create(tests.piazza(), 'plat@persona.test', 'waiter'));
+reset role;
+select tests.claims(null, null);
+delete from public.platform_admins where user_id = tests.u('ae');
+select tests.ok(tests.inv_state(tests.id('inv_plat')) = 'revocada', 'cuenta que deja la plataforma: sus invitaciones se revocan');
+delete from auth.users where id = tests.u('c8');  -- se elimina la cuenta de una persona que había aceptado
+select tests.ok((select count(*) from private.invitations where email = 'rechaza@persona.test') = 2
+  and not exists (select 1 from public.restaurant_staff where user_id = tests.u('c8')), 'cuenta eliminada: pierde el acceso y el historial de invitaciones se conserva');
+
+-- 15.12 Límites: 20 nuevas por hora y persona, 30 pendientes por restaurante
+select tests.claims('authenticated', tests.u('c5'));
+set role authenticated;
+select public.invitation_create(tests.tercero(), 'lote' || g || '@x.test', 'waiter') from generate_series(1, 20) g;
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.tercero(), 'lote21@x.test', 'waiter'), 'límite de 20 invitaciones por hora', 'límite: 20 invitaciones nuevas por hora');
+reset role;
+select tests.claims(null, null);
+insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, created_at, expires_at)
+select tests.otro(), 'cupo' || g || '@x.test', 'waiter', tests.u('b1'), 'personal', t, t + interval '168 hours'
+from generate_series(1, 30) g, (select now() - interval '2 hours' as t) x;
+select tests.claims('authenticated', tests.u('b1'));
+set role authenticated;
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.otro(), 'cupo31@x.test', 'waiter'), '30 invitaciones pendientes', 'límite: 30 pendientes por restaurante');
+select public.invitation_revoke((select id from public.invitation_list(tests.otro()) where email = 'cupo1@x.test'));
+select tests.ok(public.invitation_create(tests.otro(), 'cupo31@x.test', 'waiter') is not null, 'límite: al revocar una, se puede crear otra');
+reset role;
+
+-- 15.13 Restaurante suspendido
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select public.platform_set_suspension(tests.tercero(), true, 'Prueba de la fase 6');
+reset role;
+select tests.claims(null, null);
+insert into auth.users (id, email) values (tests.u('d1'), 'lote1@x.test');
+select tests.claims('authenticated', tests.u('c5'));
+set role authenticated;
+select tests.throws(format('select public.invitation_create(%L, %L, %L)', tests.tercero(), 'otro@x.test', 'waiter'), 'suspendido', 'suspendido: no se invita');
+select tests.ok(tests.affected(format('update public.restaurants set active = false where id = %L', tests.tercero())) = 1, 'suspendido: el propietario puede cerrarlo');
+select tests.throws(format('update public.restaurants set active = true where id = %L', tests.tercero()), 'suspendido no se puede activar', 'suspendido: no se puede abrir');
+select tests.claims('authenticated', tests.u('d1'));
+select tests.ok((select count(*) from public.my_invitations()) = 0, 'suspendido: sus invitaciones no se muestran');
+reset role;
+select tests.claims(null, null);
+insert into tests.vars select 'inv_lote1', jsonb_build_object('id', id) from private.invitations where email = 'lote1@x.test';
+select tests.claims('authenticated', tests.u('d1'));
+set role authenticated;
+select tests.throws(format('select public.invitation_accept(%L)', tests.id('inv_lote1')), 'suspendido', 'suspendido: no se acepta');
+select tests.claims('authenticated', tests.u('ad'));
+select public.platform_set_suspension(tests.tercero(), false, '');
+select tests.claims('authenticated', tests.u('d1'));
+select tests.ok(public.invitation_accept(tests.id('inv_lote1')) = tests.tercero(), 'sin suspensión: la invitación se acepta');
+reset role;
+
+-- 15.14 Funciones del servidor (para la futura Edge Function de envío de correos)
+select tests.claims('service_role', null);
+set role service_role;
+select tests.ok((select not account_exists and state = 'pendiente' and email = 'fantasma@x.test' from public.invitation_delivery(tests.id('r_sin'))),
+  'servidor: sabe que el correo no tiene cuenta (para crearla)');
+select tests.ok((select account_exists from public.invitation_delivery(tests.id('r_con'))), 'servidor: sabe que el correo ya tiene cuenta (la verá en la app)');
+select public.invitation_mark_sent(tests.id('r_sin'), 'enviada');
+select public.invitation_mark_sent(tests.id('r_con'), 'no_necesario');
+select public.invitation_mark_sent(tests.id('r_sin'), 'fallida');
+select tests.throws(format('select public.invitation_mark_sent(%L, %L)', tests.id('inv_rev'), 'enviada'), 'no está pendiente', 'servidor: no anota envíos de invitaciones cerradas');
+select tests.throws(format('select public.invitation_mark_sent(%L, %L)', tests.id('r_sin'), 'leida'), 'no válido', 'servidor: solo resultados de envío conocidos');
+reset role;
+select tests.claims(null, null);
+select tests.ok((select send_status = 'fallida' and last_sent_at is not null from private.invitations where id = tests.id('r_sin'))
+  and (select send_status = 'no_necesario' from private.invitations where id = tests.id('r_con')), 'servidor: el resultado del envío queda anotado');
+select tests.throws(format('select * from public.invitation_delivery(%L)', tests.id('r_sin')), 'Solo el servidor', 'SQL Editor sin rol de servidor: la comprobación interna también protege');
+
+-- 15.15 Auditoría (correo enmascarado)
+select tests.ok(tests.logged(tests.piazza(), 'invitacion.creada') and tests.logged(tests.piazza(), 'invitacion.reenviada')
+  and tests.logged(tests.piazza(), 'invitacion.aceptada') and tests.logged(tests.piazza(), 'invitacion.rechazada')
+  and tests.logged(tests.piazza(), 'invitacion.revocada') and tests.logged(tests.piazza(), 'invitacion.envio_fallido')
+  and tests.logged(tests.tercero(), 'plataforma.consulta_invitaciones'), 'auditoría: crear, reenviar, aceptar, rechazar, revocar, envío fallido y consultas de la plataforma');
+select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'invitador_sin_permiso')
+  and exists (select 1 from private.audit_log where action = 'invitacion.revocada' and details ->> 'motivo' = 'manual'), 'auditoría: el motivo de cada revocación');
+select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.creada' and restaurant_id = tests.tercero()
+  and actor_user_id = tests.u('ad') and actor_kind = 'plataforma' and details ->> 'funcion' = 'owner'), 'auditoría: la plataforma invitó al propietario');
+select tests.ok(exists (select 1 from private.audit_log where action = 'invitacion.aceptada' and restaurant_id = tests.tercero() and actor_user_id = tests.u('c5')),
+  'auditoría: el propietario aceptó');
+select tests.ok(not exists (select 1 from private.audit_log where action like 'invitacion.%' and (details ->> 'correo') !~ '^.\*\*\*@'),
+  'auditoría: los correos de las invitaciones se guardan enmascarados');
+select tests.ok(not exists (select 1 from private.audit_log where details::text like '%reenvio@persona.test%' or details::text like '%fantasma@x.test%'),
+  'auditoría: ningún correo invitado completo en el registro');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok(exists (select 1 from public.audit_list(tests.piazza(), 500) where action = 'invitacion.creada'), 'owner: ve las invitaciones en su registro');
+reset role;
+
+-- 15.16 El SQL Editor sigue pudiendo crear restaurantes abiertos (por ejemplo seed.sql)
+select tests.claims(null, null);
+select tests.ok(tests.affected($$insert into public.restaurants (slug, name, active) values ('desde-sql-editor', 'Desde SQL Editor', true)$$) = 1,
+  'SQL Editor: puede crear restaurantes abiertos (datos iniciales)');
 
 -- ===================== Resultado =====================
 \o

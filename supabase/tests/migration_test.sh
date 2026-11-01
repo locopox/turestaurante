@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prueba la cadena de migraciones en un PostgreSQL LOCAL y desechable. Nunca contra Supabase.
-#   a5d5a87 (fase 2) + datos → fase 3 → fase 4 → fase 5  ==  instalación nueva de schema.sql
+#   a5d5a87 (fase 2) + datos → fase 3 → fase 4 → fase 5 → fase 6  ==  instalación nueva de schema.sql
 #   las subidas se pueden repetir y no alteran datos
-#   cada bajada restaura la fase anterior: 5 → 4 (b48fb53) → 3 (07348e4) → 2 (a5d5a87)
+#   cada bajada restaura la fase anterior: 6 → 5 (55c6837) → 4 (b48fb53) → 3 (07348e4) → 2 (a5d5a87)
 set -euo pipefail
 export PGOPTIONS="-c client_min_messages=warning"
 cd "$(dirname "$0")/.."
@@ -11,12 +11,15 @@ UP3=migrations/20261101120000_fase3_seguridad_roles.sql
 UP4=migrations/20261102120000_fase4_modo_soporte.sql
 UP5=migrations/20261103120000_fase5_soporte_caducidad_registro.sql
 DOWN5=migrations_down/20261103120000_fase5_soporte_caducidad_registro.down.sql
+UP6=migrations/20261104120000_fase6_invitaciones.sql
+DOWN6=migrations_down/20261104120000_fase6_invitaciones.down.sql
 DOWN3=migrations_down/20261101120000_fase3_seguridad_roles.down.sql
 DOWN4=migrations_down/20261102120000_fase4_modo_soporte.down.sql
 TMP=$(mktemp -d)
 git show a5d5a87:supabase/schema.sql > "$TMP/schema_f2.sql"
 git show 07348e4:supabase/schema.sql > "$TMP/schema_f3.sql"
 git show b48fb53:supabase/schema.sql > "$TMP/schema_f4.sql"
+git show 55c6837:supabase/schema.sql > "$TMP/schema_f5.sql"
 P() { psql -v ON_ERROR_STOP=1 -q -d "$1" "${@:2}"; }
 nuevo_db() { psql -q -d postgres -c "drop database if exists $1" -c "create database $1"; P "$1" -f tests/supabase_shim.sql 2>/dev/null; }
 volcado() { pg_dump --schema-only -d "$1" | grep -vE '^(--|SET |SELECT pg_catalog|\\(un)?restrict )' | sed '/^$/d' > "$2"; }
@@ -39,7 +42,8 @@ iguales() {
 nuevo_db mig_ref2; P mig_ref2 -f "$TMP/schema_f2.sql"; volcado mig_ref2 "$TMP/f2.sql"
 nuevo_db mig_ref3; P mig_ref3 -f "$TMP/schema_f3.sql"; volcado mig_ref3 "$TMP/f3.sql"
 nuevo_db mig_ref4; P mig_ref4 -f "$TMP/schema_f4.sql"; volcado mig_ref4 "$TMP/f4.sql"
-nuevo_db mig_ref5; P mig_ref5 -f schema.sql; volcado mig_ref5 "$TMP/f5.sql"
+nuevo_db mig_ref5; P mig_ref5 -f "$TMP/schema_f5.sql"; volcado mig_ref5 "$TMP/f5.sql"
+nuevo_db mig_ref6; P mig_ref6 -f schema.sql; volcado mig_ref6 "$TMP/f6.sql"
 
 nuevo_db mig_cadena; P mig_cadena -f "$TMP/schema_f2.sql"; con_datos mig_cadena; D0=$(datos mig_cadena)
 P mig_cadena -f "$UP3"; volcado mig_cadena "$TMP/c3.sql"; iguales "$TMP/f3.sql" "$TMP/c3.sql" "fase 2 + subida fase 3 = esquema de la fase 3"
@@ -50,22 +54,49 @@ P mig_cadena -c "insert into auth.users (id, email) values ('a0000000-0000-4000-
   -c "insert into private.support_grants (restaurant_id, requested_by, requested_by_email, reason) values ('5e5e0000-0000-4000-8000-000000000001', 'a0000000-0000-4000-8000-0000000000ad', 'admin@plataforma.test', 'Solicitud anterior a la fase 5')"
 soporte() { P mig_cadena -tAc "select count(*) || ':' || string_agg(reason || '/' || status, ',') from private.support_grants"; }
 S0=$(soporte)
-P mig_cadena -f "$UP5"; volcado mig_cadena "$TMP/c5.sql"; iguales "$TMP/f5.sql" "$TMP/c5.sql" "fase 4 + subida fase 5 = instalación nueva"
+P mig_cadena -f "$UP5"; volcado mig_cadena "$TMP/c5.sql"; iguales "$TMP/f5.sql" "$TMP/c5.sql" "fase 4 + subida fase 5 = esquema de la fase 5"
 [ "$(soporte)" = "$S0" ] || fallo "la subida de la fase 5 ha cambiado los accesos de soporte"
 echo "OK  la subida de la fase 5 conserva los accesos de soporte ($S0)"
+# Cuentas y propietario de La Piazza antes de la fase 6 (no deben cambiar).
+cuentas() { P mig_cadena -tAc "select string_agg(id || ':' || email, ',' order by id) || '|' || (select string_agg(user_id || ':' || role, ',' order by user_id) from restaurant_staff) || '|' || (select active::text from restaurants where id = '5e5e0000-0000-4000-8000-000000000001') from auth.users"; }
+U0=$(cuentas)
+P mig_cadena -f "$UP6"; volcado mig_cadena "$TMP/c6.sql"; iguales "$TMP/f6.sql" "$TMP/c6.sql" "fase 5 + subida fase 6 = instalación nueva"
+[ "$(soporte)" = "$S0" ] || fallo "la subida de la fase 6 ha cambiado los accesos de soporte"
+[ "$(cuentas)" = "$U0" ] || fallo "la subida de la fase 6 ha cambiado cuentas, personal o la apertura de La Piazza"
+echo "OK  la subida de la fase 6 conserva cuentas, personal, apertura de La Piazza y accesos de soporte"
 [ "$(datos mig_cadena)" = "$D0" ] || fallo "las subidas han cambiado datos"
 echo "OK  las subidas conservan los datos ($D0: restaurantes/productos/pedidos/líneas/personal/importe)"
-P mig_cadena -f "$UP3"; P mig_cadena -f "$UP4"; P mig_cadena -f "$UP5"; volcado mig_cadena "$TMP/c5b.sql"
-diff -q "$TMP/c5.sql" "$TMP/c5b.sql" > /dev/null || fallo "repetir las subidas cambia la estructura"
+P mig_cadena -f "$UP3"; P mig_cadena -f "$UP4"; P mig_cadena -f "$UP5"; P mig_cadena -f "$UP6"; volcado mig_cadena "$TMP/c6b.sql"
+diff -q "$TMP/c6.sql" "$TMP/c6b.sql" > /dev/null || fallo "repetir las subidas cambia la estructura"
 [ "$(datos mig_cadena)" = "$D0" ] || fallo "repetir las subidas ha cambiado datos"
+[ "$(cuentas)" = "$U0" ] || fallo "repetir las subidas ha cambiado cuentas o personal"
 echo "OK  las subidas se pueden repetir"
+# Con la fase 6: una persona acepta una invitación de La Piazza y otra queda pendiente.
+P mig_cadena -c "do \$\$ declare v uuid; begin
+  insert into auth.users (id, email) values ('a0000000-0000-4000-8000-0000000000b9', 'invitado@piazza.test');
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, expires_at)
+    values ('5e5e0000-0000-4000-8000-000000000001', 'invitado@piazza.test', 'waiter', 'a0000000-0000-4000-8000-0000000000a1', 'personal', now() + interval '168 hours')
+    returning id into v;
+  insert into private.invitations (restaurant_id, email, role, invited_by, invited_by_kind, expires_at)
+    values ('5e5e0000-0000-4000-8000-000000000001', 'pendiente@piazza.test', 'kitchen', 'a0000000-0000-4000-8000-0000000000a1', 'personal', now() + interval '168 hours');
+  perform set_config('request.jwt.claims', '{\"role\":\"authenticated\",\"sub\":\"a0000000-0000-4000-8000-0000000000b9\"}', true);
+  perform public.invitation_accept(v);
+end \$\$"
+D1=$(datos mig_cadena); U1=$(cuentas)
+[ "$D1" != "$D0" ] || fallo "la invitación aceptada no ha dado de alta a nadie"
+P mig_cadena -f "$DOWN6"; volcado mig_cadena "$TMP/b5.sql"; iguales "$TMP/f5.sql" "$TMP/b5.sql" "bajada fase 6 = esquema de la fase 5"
+[ "$(datos mig_cadena)" = "$D1" ] && [ "$(cuentas)" = "$U1" ] || fallo "la bajada de la fase 6 ha cambiado datos, cuentas o personal"
+[ "$(soporte)" = "$S0" ] || fallo "la bajada de la fase 6 ha cambiado los accesos de soporte"
+echo "OK  la bajada de la fase 6 conserva datos, cuentas, personal (incluida la persona que aceptó) y soporte"
+P mig_cadena -tAc "select count(*) from private.audit_log where action like 'invitacion.%'" | grep -qx 3 || fallo "la bajada de la fase 6 ha perdido entradas de auditoría"
+echo "OK  la bajada de la fase 6 conserva el registro de auditoría de las invitaciones"
 P mig_cadena -f "$DOWN5"; volcado mig_cadena "$TMP/b4.sql"; iguales "$TMP/f4.sql" "$TMP/b4.sql" "bajada fase 5 = esquema de la fase 4"
 [ "$(soporte)" = "$S0" ] || fallo "la bajada de la fase 5 ha cambiado los accesos de soporte"
 echo "OK  la bajada de la fase 5 conserva los accesos de soporte"
 P mig_cadena -f "$DOWN4"; volcado mig_cadena "$TMP/b3.sql"; iguales "$TMP/f3.sql" "$TMP/b3.sql" "bajada fase 4 = esquema de la fase 3"
 P mig_cadena -f "$DOWN3"; volcado mig_cadena "$TMP/b2.sql"; iguales "$TMP/f2.sql" "$TMP/b2.sql" "bajada fase 3 = esquema de la fase 2"
-[ "$(datos mig_cadena)" = "$D0" ] || fallo "las bajadas han cambiado datos"
+[ "$(datos mig_cadena)" = "$D1" ] || fallo "las bajadas han cambiado datos"
 echo "OK  las bajadas conservan pedidos, carta, restaurantes y personal"
-psql -q -d postgres -c "drop database mig_ref2" -c "drop database mig_ref3" -c "drop database mig_ref4" -c "drop database mig_ref5" -c "drop database mig_cadena"
+psql -q -d postgres -c "drop database mig_ref2" -c "drop database mig_ref3" -c "drop database mig_ref4" -c "drop database mig_ref5" -c "drop database mig_ref6" -c "drop database mig_cadena"
 rm -rf "$TMP"
 echo "Migraciones: todas las comprobaciones superadas"

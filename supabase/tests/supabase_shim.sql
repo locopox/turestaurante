@@ -11,7 +11,8 @@ do $$ begin
 end $$;
 
 create schema auth;
-create table auth.users (id uuid primary key, email text);
+-- email_confirmed_at: como en Supabase Auth (null hasta que la persona confirma su correo).
+create table auth.users (id uuid primary key, email text, email_confirmed_at timestamptz default now());
 
 create function auth.uid() returns uuid language sql stable as $$
   select nullif(coalesce(current_setting('request.jwt.claim.sub', true),

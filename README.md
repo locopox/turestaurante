@@ -76,10 +76,11 @@ supabase/
 | `manager` (encargado) | Lo de sala, más la carta y los precios, y el equipo de **sala y cocina** (alta, cambio de función, baja). No toca propietarios ni encargados, ni la configuración del restaurante. |
 | `owner` (propietario) | Todo lo anterior en **su** restaurante, la configuración del restaurante, los encargados y el registro de auditoría. No nombra propietarios. |
 | Plataforma (`platform_admins`) | Crear restaurantes, cambiar su dirección web, suspenderlos y reactivarlos, gestionar propietarios y leer el registro (sus consultas quedan registradas). **No tiene acceso operativo**: no ve pedidos, cocina ni avisos de pago, ni edita la carta. Una cuenta de plataforma no puede ser personal de ningún restaurante. |
-| Servidor (`service_role`) | Administrar restaurantes, carta y personal. Sobre pedidos y pagos solo **lee**: los cambia únicamente con `payment_checkout_started` y `payment_record_result`. No tiene permisos sobre tablas ajenas a TuRestaurante. |
+| Servidor (`service_role`) | Administrar restaurantes y carta (desde la fase 6 **no** escribe en `restaurant_staff` ni en `platform_admins`). Sobre pedidos y pagos solo **lee**: los cambia únicamente con `payment_checkout_started` y `payment_record_result`. No tiene permisos sobre tablas ajenas a TuRestaurante. |
 
-- **Equipo**: nadie escribe directamente en `restaurant_staff`; se usa `staff_add_member`, `staff_change_role` y
-  `staff_remove_member`. Nadie cambia ni quita su propio acceso, y siempre queda al menos un propietario.
+- **Equipo**: nadie escribe directamente en `restaurant_staff`. Desde la fase 6 **solo se entra aceptando una
+  invitación** (`invitation_accept`); los cambios y bajas siguen con `staff_change_role` y `staff_remove_member`.
+  Nadie cambia ni quita su propio acceso, y siempre queda al menos un propietario.
 - **Suspensión**: `restaurants.suspended_at` solo lo cambia la plataforma (`platform_set_suspension`). Un restaurante
   suspendido no acepta pedidos aunque su propietario lo marque como abierto; el personal puede terminar los ya hechos.
   El motivo se guarda en el registro, no en la tabla pública de restaurantes.
@@ -120,6 +121,37 @@ supabase/
    (`anon`) no llegan a ejecutarse, así que no se anotan.
 
 En el modo demo el soporte no está disponible: necesita cuentas reales de plataforma y de propietario separadas.
+
+### Invitaciones (fase 6 · etapa 1: base de datos)
+
+Solo está hecha la parte de base de datos. La Edge Function que envía los correos (E2) y las pantallas (E3)
+llegarán después: **mientras tanto, «Añadir al equipo» de la app no funciona con Supabase** (ya no existe
+`staff_add_member`).
+
+- **Nadie tiene permisos antes de aceptar.** La invitación vive en `private.invitations` (no accesible por la API)
+  y ninguna comprobación de permisos la lee. El único alta en un equipo es `invitation_accept(id)`, que exige:
+  sesión, el **correo confirmado** de la cuenta igual al de la invitación, pendiente y sin caducar, restaurante no
+  suspendido, no ser cuenta de plataforma, no estar ya en el equipo y que **quien invitó siga pudiendo dar esa
+  función**. La función concedida es la de la invitación, nunca un parámetro.
+- **Quién invita a quién** (`invitation_create`): la plataforma, a cualquier función (los propietarios y
+  copropietarios, **solo** ella); el owner, a encargados, sala y cocina; el encargado, a sala y cocina. El manager ve
+  todas las invitaciones de su restaurante y gestiona solo las de sala y cocina.
+- **Restaurante nuevo** (`platform_create_restaurant`): se crea **cerrado** junto con la invitación de su
+  propietario. Desde la app no se puede abrir sin propietario ni mientras esté suspendido.
+- **No se revela nada a quien invita**: la respuesta es la misma tenga o no cuenta el correo, y sea de otro
+  restaurante o de la plataforma. Si ya tiene cuenta, la verá dentro de TuRestaurante (`my_invitations`) y no se toca
+  su contraseña. Una persona puede estar en varios restaurantes con permisos independientes; al salir de uno pierde
+  ese acceso al instante y conserva su cuenta y los demás.
+- **Caducan a los 7 días.** Una caducada no se acepta, rechaza, reenvía ni reactiva: se crea otra (la antigua queda
+  «reemplazada»). Reenviar (`invitation_resend`) crea una nueva con 7 días más: como mucho 3 veces y con 5 minutos
+  entre reenvíos. También se pueden **rechazar** (`invitation_decline`) y **revocar** (`invitation_revoke`).
+- Si quien invitó pierde la función, deja el equipo o se elimina su cuenta, sus invitaciones pendientes se revocan.
+- **Límites**: 20 invitaciones nuevas por hora y persona, 30 pendientes por restaurante.
+- **Integridad** (también desde el SQL Editor): el historial no se borra, sus datos no cambian, una invitación
+  cerrada no se reactiva y una caducada no se acepta. Auditoría de crear, reenviar, aceptar, rechazar, revocar y
+  envíos fallidos, con el **correo enmascarado** (`j***@ejemplo.com`).
+- **Solo para el servidor** (futura Edge Function): `invitation_delivery` (incluye si el correo ya tiene cuenta, dato
+  que nunca llega a quien invita) e `invitation_mark_sent`.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
@@ -132,7 +164,7 @@ En el modo demo el soporte no está disponible: necesita cuentas reales de plata
 ```bash
 npm test          # reglas de pedido, modo demo, permisos y variables de entorno (Vitest)
 npm run test:db         # seguridad del SQL: necesita un PostgreSQL LOCAL (no Supabase)
-npm run test:migration  # migraciones fases 3 a 5: subida, repetición y bajada (PostgreSQL LOCAL)
+npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada (PostgreSQL LOCAL)
 ```
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
@@ -149,16 +181,20 @@ npm run test:migration  # migraciones fases 3 a 5: subida, repetición y bajada 
 - `supabase/migrations/20261103120000_fase5_soporte_caducidad_registro.sql` (después de la anterior) añade la
   caducidad de 24 h de las solicitudes y el registro de consultas denegadas. No borra datos. **Cambia la respuesta
   de `support_view_*`** a `{ok, data}`: hay que desplegar a la vez la versión de la app de esta rama.
-- `supabase/migrations_down/` las deshace (primero la de la fase 5; esta **borra el registro de consultas
+- `supabase/migrations/20261104120000_fase6_invitaciones.sql` (después de la anterior) añade las invitaciones. No
+  borra ni modifica datos ni cuentas. **Elimina `staff_add_member`** y quita al servidor la escritura en
+  `restaurant_staff` y `platform_admins`.
+- `supabase/migrations_down/` las deshace (primero la de la fase 6, que **borra el historial de invitaciones**,
+  también las pendientes, y conserva a quien ya aceptó; después la de la fase 5, que **borra el registro de consultas
   denegadas**). La de la fase 4 **borra el historial de
   accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y
   las suspensiones**.
-- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 es idéntica a una
+- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 → fase 6 es idéntica a una
   instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
 
 Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
-hace falta una cuenta de personal distinta (por ejemplo, un propietario), que la plataforma añade en
-Administración → Equipo, o desde el SQL Editor:
+hace falta una cuenta de personal distinta (por ejemplo, un propietario). Desde la fase 6 se invita
+(`invitation_create` y la persona la acepta); en una emergencia, desde el SQL Editor:
 
 ```sql
 insert into public.restaurant_staff (restaurant_id, user_id, role)
