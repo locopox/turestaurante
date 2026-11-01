@@ -21,6 +21,13 @@ export const auditActionLabel: Record<string, string> = {
   'plataforma.consulta_equipo': 'La plataforma consultó el equipo',
   'plataforma.consulta_registro': 'La plataforma consultó el registro',
   'plataforma.alta_admin': 'Alta de administrador de plataforma',
+  'soporte.solicitud': 'Soporte: solicitud de acceso',
+  'soporte.aprobacion': 'Soporte: acceso aprobado (2 horas)',
+  'soporte.rechazo': 'Soporte: solicitud rechazada',
+  'soporte.revocacion': 'Soporte: acceso revocado',
+  'soporte.cancelacion': 'Soporte: solicitud cancelada',
+  'soporte.caducidad_adelantada': 'Soporte: caducidad adelantada',
+  'soporte.consulta': 'Soporte: consulta de datos',
   'plataforma.baja_admin': 'Baja de administrador de plataforma',
 };
 

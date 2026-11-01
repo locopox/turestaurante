@@ -22,6 +22,7 @@ const demoSession = (restaurants: { id: string }[]): StaffSession => ({
   memberships: restaurants.map((r) => ({ restaurantId: r.id, role: 'owner' })),
 });
 const NO_ACCOUNTS = 'En el modo demo no hay cuentas de personal: el equipo se gestiona con Supabase.';
+const NO_SUPPORT = 'El modo soporte necesita Supabase: en la demo no hay cuentas de plataforma ni de propietario separadas.';
 /** Restaurantes guardados por versiones anteriores de la demo no tienen «suspended». */
 const normalize = (r: Restaurant): Restaurant => ({ ...r, suspended: r.suspended ?? false });
 
@@ -312,6 +313,35 @@ export class MockDataService implements DataService {
   }
   async listAudit() {
     return [];
+  }
+  // Modo soporte: necesita cuentas reales (plataforma y propietario distintos), así que en la demo
+  // no está disponible.
+  async requestSupport(): Promise<void> {
+    throw new Error(NO_SUPPORT);
+  }
+  async listSupportRequests() {
+    return [];
+  }
+  async mySupportRequests() {
+    return [];
+  }
+  async decideSupport(): Promise<void> {
+    throw new Error(NO_SUPPORT);
+  }
+  async revokeSupport(): Promise<void> {
+    throw new Error(NO_SUPPORT);
+  }
+  async cancelSupport(): Promise<void> {
+    throw new Error(NO_SUPPORT);
+  }
+  async supportViewRestaurant(): Promise<never> {
+    throw new Error(NO_SUPPORT);
+  }
+  async supportViewOrders(): Promise<never> {
+    throw new Error(NO_SUPPORT);
+  }
+  async supportViewPaymentEvents(): Promise<never> {
+    throw new Error(NO_SUPPORT);
   }
   async setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string) {
     if (suspended && reason.trim().length < 3) throw new Error('Indica el motivo de la suspensión');

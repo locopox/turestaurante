@@ -159,6 +159,56 @@ export interface AuditEntry {
   details: Record<string, unknown>;
 }
 
+/** Acceso de soporte (solo lectura, 2 horas, aprobado por el propietario). */
+export type SupportStatus = 'pendiente' | 'aprobada' | 'rechazada' | 'revocada' | 'cancelada' | 'caducada';
+
+export interface SupportGrant {
+  id: string;
+  restaurantId: string | null;
+  restaurantName: string | null;
+  requestedByEmail: string | null;
+  reason: string;
+  status: SupportStatus;
+  requestedAt: string;
+  decidedAt: string | null;
+  decidedByEmail: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
+/** Consultas de soporte: sin nombres, teléfonos, notas ni referencias de pago de clientes. */
+export interface SupportRestaurantView {
+  expiresAt: string;
+  restaurant: { name: string; slug: string; active: boolean; suspended: boolean; tables: number; pickupEnabled: boolean;
+    onlinePaymentEnabled: boolean; counterPaymentEnabled: boolean; prepMinutes: number };
+  menu: { categories: number; products: number; unavailable: number };
+  staff: Partial<Record<StaffRole, number>>;
+  orders: { last24h: number; inProgress: number; pendingOnline: number; pendingCounter: number; lastOrderAt: string | null };
+}
+export interface SupportOrderView {
+  number: number;
+  createdAt: string;
+  updatedAt: string;
+  mode: OrderMode;
+  table: number | null;
+  pickupTime: string | null;
+  prepStatus: PrepStatus;
+  paymentMethod: PaymentMethod;
+  paymentStatus: PaymentStatus;
+  total: Cents;
+  hasNotes: boolean;
+  hasPaymentRef: boolean;
+  items: { name: string; quantity: number; unitPrice: Cents; hasNotes: boolean }[];
+}
+export interface SupportPaymentEventView {
+  createdAt: string;
+  outcome: string;
+  resolution: string;
+  amount: Cents | null;
+  detail: string;
+  orderNumber: number | null;
+}
+
 export interface StaffSession {
   userId: string;
   email: string;

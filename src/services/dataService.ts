@@ -1,7 +1,8 @@
 import type { AuthRedirect } from '../lib/authRedirect';
 import type {
   AuditEntry, Category, KitchenTicket, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
-  PrepStatus, Product, Restaurant, StaffMember, StaffRole, StaffSession,
+  PrepStatus, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant, SupportOrderView,
+  SupportPaymentEventView, SupportRestaurantView,
 } from '../types';
 
 export interface Menu {
@@ -83,6 +84,20 @@ export interface DataService {
   setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string): Promise<void>;
   /** restaurantId null: registro completo (solo plataforma). */
   listAudit(restaurantId: string | null): Promise<AuditEntry[]>;
+
+  // Modo soporte: la plataforma pide acceso de solo lectura; el propietario lo aprueba (2 horas)
+  requestSupport(restaurantId: string, reason: string): Promise<void>;
+  /** Solicitudes de un restaurante (propietario). */
+  listSupportRequests(restaurantId: string): Promise<SupportGrant[]>;
+  /** Solicitudes propias (plataforma). */
+  mySupportRequests(): Promise<SupportGrant[]>;
+  decideSupport(grantId: string, approve: boolean): Promise<void>;
+  revokeSupport(grantId: string): Promise<void>;
+  cancelSupport(grantId: string): Promise<void>;
+  /** Consultas de solo lectura; cada una la comprueba y la registra la base de datos. */
+  supportViewRestaurant(restaurantId: string): Promise<SupportRestaurantView>;
+  supportViewOrders(restaurantId: string): Promise<SupportOrderView[]>;
+  supportViewPaymentEvents(restaurantId: string): Promise<SupportPaymentEventView[]>;
 
   /**
    * Resultado de la pasarela SIMULADA del modo demo. Con Supabase lanza error: el estado del

@@ -88,8 +88,26 @@ supabase/
   productos, cancelaciones, cobros, pagos verificados, suspensiones, dirección web, apertura y consultas de la
   plataforma. Guarda quién (usuario y tipo), cuándo y qué. Lo leen el propietario (su restaurante) y la plataforma
   con `audit_list`.
-- **Modo soporte** (que la plataforma intervenga en un restaurante): **pendiente de decisión**, no implementado.
-  Mientras tanto, la plataforma no tiene ninguna vía de acceso operativo.
+- **Modo soporte** (ver abajo): la plataforma solo puede **leer** un restaurante si su propietario lo aprueba,
+  durante 2 horas, y cada consulta queda registrada.
+
+### Modo soporte
+
+1. La cuenta de plataforma pide acceso a **un** restaurante con un motivo (Administración → Soporte).
+2. **Solo el propietario** de ese restaurante puede aprobarlo o rechazarlo (Administración → Soporte; también ve
+   un aviso). Ni la plataforma, ni el encargado, ni el propietario de otro restaurante pueden aprobar.
+3. El acceso es de **solo lectura** y dura **exactamente 2 horas** desde la aprobación. El propietario puede
+   revocarlo en cualquier momento y quien lo pidió puede terminarlo antes. Nadie puede ampliarlo.
+4. Durante el acceso, la plataforma consulta con tres funciones: `support_view_restaurant` (estado, carta y
+   equipo por funciones, sin emails), `support_view_orders` (pedidos **sin nombre, teléfono, notas ni referencia
+   de pago** del cliente) y `support_view_payment_events`. Cada función comprueba el acceso **en cada llamada**: la
+   caducidad, la revocación o dejar de ser plataforma lo cortan al instante, aunque la sesión siga abierta.
+5. No hay lectura directa de tablas ni ningún permiso de escritura: la plataforma sigue sin poder cambiar pedidos,
+   precios, cobros, productos, equipo ni configuración.
+6. Queda registrado quién pide, quién aprueba o rechaza, inicio y caducidad, cada consulta (qué datos), y quién
+   revoca o cancela. El propietario lo ve en Administración → Registro. El historial de accesos no se puede borrar.
+
+En el modo demo el soporte no está disponible: necesita cuentas reales de plataforma y de propietario separadas.
 - **Nadie** puede cambiar el total, las líneas, la referencia de pago ni los datos de un pedido ya creado (trigger).
 - Los precios y totales los calcula la base de datos con la carta; el navegador solo envía producto y cantidad.
 - **El historial no se pierde.** Un restaurante con pedidos no se puede borrar (se desactiva). Un producto o una
@@ -113,10 +131,14 @@ npm run test:migration  # migración de la fase 3: subida, repetición y bajada 
 
 - `supabase/schema.sql` es el esquema completo (instalación nueva; se puede repetir).
 - `supabase/migrations/20261101120000_fase3_seguridad_roles.sql` actualiza una base que ya tiene el esquema
-  anterior (rama `fase2-recuperar-contrasena`). No borra datos.
-- `supabase/migrations_down/…down.sql` la deshace. **Borra el registro de auditoría y las suspensiones.**
-- `npm run test:migration` comprueba en local que subir deja la base idéntica a una instalación nueva, que se puede
-  repetir, que bajar restaura la versión anterior y que los datos no cambian.
+  de la rama `fase2-recuperar-contrasena`. No borra datos.
+- `supabase/migrations/20261102120000_fase4_modo_soporte.sql` (después de la anterior) añade el modo soporte.
+  No borra datos ni modifica objetos existentes.
+- `supabase/migrations_down/` las deshace (primero la de la fase 4). La de la fase 4 **borra el historial de
+  accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y
+  las suspensiones**.
+- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 es idéntica a una
+  instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
 
 Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
 hace falta una cuenta de personal distinta (por ejemplo, un propietario), que la plataforma añade en

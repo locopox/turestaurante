@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { data, type Menu } from '../services';
-import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession } from '../types';
+import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession, SupportGrant } from '../types';
 
 interface Loadable<T> {
   value: T | undefined;
@@ -72,6 +72,14 @@ export const useStaff = (restaurantId: string) =>
 
 export const useAudit = (restaurantId: string | null) =>
   useLoad<AuditEntry[]>(() => data.listAudit(restaurantId), null, [restaurantId]);
+
+/** Solicitudes de soporte de un restaurante (propietario). */
+export const useSupportRequests = (restaurantId: string, enabled: boolean) =>
+  useLoad<SupportGrant[]>(() => (enabled ? data.listSupportRequests(restaurantId) : Promise.resolve([])), null, [restaurantId, enabled]);
+
+/** Solicitudes de soporte propias (plataforma). */
+export const useMySupportRequests = (enabled: boolean) =>
+  useLoad<SupportGrant[]>(() => (enabled ? data.mySupportRequests() : Promise.resolve([])), null, [enabled]);
 
 /** Reloj que se actualiza periódicamente (tiempos de espera en cocina). */
 export function useNow(intervalMs = 30000) {

@@ -4,15 +4,19 @@ import { ART_OPTIONS, FoodArt } from '../../components/FoodArt';
 import { useToast } from '../../components/Toast';
 import { Badge, Icon, Modal, Notice, Spinner } from '../../components/ui';
 import { config, onlinePaymentsAvailable } from '../../config';
-import { useAudit, useMenu, useOrders, useRestaurants, useStaff } from '../../hooks/useData';
+import { useAudit, useMenu, useMySupportRequests, useNow, useOrders, useRestaurants, useStaff, useSupportRequests } from '../../hooks/useData';
 import { hrefFor } from '../../hooks/useRoute';
 import { auditActionLabel, auditActor, auditDetails } from '../../lib/audit';
-import { formatPrice, slugify } from '../../lib/format';
+import { formatPrice, formatTime, orderCode, paymentLabel, prepLabel, slugify } from '../../lib/format';
+import { isSupportActive, remainingLabel, supportStatusLabel } from '../../lib/support';
 import { data } from '../../services';
 import { can, canOpenAdmin, manageableRoles, roleLabel } from '../../lib/permissions';
-import type { FoodArt as Art, Product, Restaurant, StaffRole, StaffSession } from '../../types';
+import type {
+  FoodArt as Art, Product, Restaurant, StaffRole, StaffSession, SupportGrant, SupportOrderView, SupportPaymentEventView,
+  SupportRestaurantView,
+} from '../../types';
 
-type Tab = 'datos' | 'carta' | 'equipo' | 'registro' | 'qr';
+type Tab = 'datos' | 'carta' | 'equipo' | 'registro' | 'soporte' | 'qr';
 
 export function AdminView({ selectedId, onSelect, session }: { selectedId: string; onSelect: (id: string) => void; session: StaffSession | null }) {
   const { value: all = [], loading } = useRestaurants();
@@ -28,6 +32,7 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
     ['carta', 'Carta', can(session, current?.id, 'menu.edit')],
     ['equipo', 'Equipo', can(session, current?.id, 'staff.manage')],
     ['registro', 'Registro', can(session, current?.id, 'audit.view')],
+    ['soporte', 'Soporte', can(session, current?.id, 'support.request') || can(session, current?.id, 'support.approve')],
     ['qr', 'Mesas y QR', true],
   ] as const).filter(([, , show]) => show);
   const activeTab: Tab = tabs.some(([id]) => id === tab) ? tab : 'datos';
@@ -72,6 +77,9 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
                   Restaurante <strong>suspendido por la plataforma</strong>: no acepta pedidos nuevos. Los pedidos ya hechos se pueden terminar.
                 </Notice>
               )}
+              {can(session, current.id, 'support.approve') && data.kind !== 'mock' && (
+                <PendingSupportNotice key={`p-${current.id}`} restaurant={current} onOpen={() => setTab('soporte')} />
+              )}
               <RestaurantSummary restaurant={current} showOrders={can(session, current.id, 'orders.view')} />
               <div className="segmented" role="tablist" aria-label="Secciones">
                 {tabs.map(([id, label]) => (
@@ -85,6 +93,13 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
               {activeTab === 'carta' && <MenuEditor key={current.id} restaurant={current} />}
               {activeTab === 'equipo' && <TeamPanel key={current.id} restaurant={current} session={session} />}
               {activeTab === 'registro' && <AuditPanel key={current.id} restaurant={current} />}
+              {activeTab === 'soporte' && (
+                data.kind === 'mock'
+                  ? <Notice>El modo soporte necesita Supabase: en la demo no hay cuentas de plataforma y de propietario separadas.</Notice>
+                  : can(session, current.id, 'support.request')
+                    ? <SupportRequestPanel key={current.id} restaurant={current} />
+                    : <SupportOwnerPanel key={current.id} restaurant={current} />
+              )}
               {activeTab === 'qr' && <QrSheet key={current.id} restaurant={current} />}
             </section>
           )}
@@ -515,5 +530,226 @@ function CreateRestaurant({ open, onClose, onCreated }: { open: boolean; onClose
         <button className="btn btn--primary btn--block" type="submit">Crear restaurante</button>
       </form>
     </Modal>
+  );
+}
+
+/** Propietario: aviso si hay solicitudes de soporte pendientes. */
+function PendingSupportNotice({ restaurant, onOpen }: { restaurant: Restaurant; onOpen: () => void }) {
+  const { value: requests = [] } = useSupportRequests(restaurant.id, true);
+  const pending = requests.filter((g) => g.status === 'pendiente').length;
+  if (!pending) return null;
+  return (
+    <Notice tone="warn">
+      La plataforma ha pedido acceso de soporte a {restaurant.name}.{' '}
+      <button type="button" className="link-btn" onClick={onOpen}>Revisar solicitud</button>
+    </Notice>
+  );
+}
+
+function SupportHistory({ grants }: { grants: SupportGrant[] }) {
+  if (!grants.length) return <p className="muted small">Sin solicitudes anteriores.</p>;
+  return (
+    <ul className="audit">
+      {grants.map((g) => (
+        <li key={g.id} className="audit__row">
+          <span className="muted small mono">{new Date(g.requestedAt).toLocaleString('es-ES')}</span>
+          <strong>{supportStatusLabel[g.status]}</strong>
+          <span className="small">{g.requestedByEmail ? `${g.requestedByEmail}: ` : ''}{g.reason}</span>
+          {g.decidedAt && <span className="muted small">Respondida por {g.decidedByEmail || '—'} el {new Date(g.decidedAt).toLocaleString('es-ES')}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Propietario: ver, aprobar (2 horas, solo lectura), rechazar y revocar. */
+function SupportOwnerPanel({ restaurant }: { restaurant: Restaurant }) {
+  const toast = useToast();
+  const now = useNow(30000);
+  const { value: grants = [], loading, error, reload } = useSupportRequests(restaurant.id, true);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<void>, ok: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      toast(ok);
+    } catch (e) {
+      toast((e as Error).message, 'danger');
+    } finally {
+      setBusy(false);
+      setConfirming(null);
+      reload();
+    }
+  };
+  const pending = grants.filter((g) => g.status === 'pendiente');
+  const active = grants.filter((g) => isSupportActive(g, now));
+  const past = grants.filter((g) => g.status !== 'pendiente' && !isSupportActive(g, now));
+
+  return (
+    <div className="stack-lg">
+      <Notice>
+        Solo tú, como propietario, puedes dar acceso de soporte. Es de <strong>solo lectura</strong>, dura <strong>2 horas</strong> y
+        puedes revocarlo cuando quieras. Cada consulta queda en el Registro. No incluye nombres, teléfonos ni notas de clientes.
+      </Notice>
+      {error && <Notice tone="danger">{error}</Notice>}
+      {loading && !grants.length ? <Spinner /> : null}
+      {active.map((g) => (
+        <section key={g.id} className="card stack">
+          <h3 className="card__title">Acceso de soporte activo</h3>
+          <p>{g.requestedByEmail} · quedan <strong>{remainingLabel(g.expiresAt!, now)}</strong> (hasta las {formatTime(g.expiresAt!)})</p>
+          <p className="muted small">Motivo: {g.reason}</p>
+          <button className="btn btn--danger" disabled={busy} onClick={() => run(() => data.revokeSupport(g.id), 'Acceso de soporte revocado')}>Revocar ahora</button>
+        </section>
+      ))}
+      {pending.map((g) => (
+        <section key={g.id} className="card stack">
+          <h3 className="card__title">Solicitud pendiente</h3>
+          <p><strong>{g.requestedByEmail}</strong> pide acceso de solo lectura.</p>
+          <p className="muted">Motivo: {g.reason}</p>
+          {confirming === g.id ? (
+            <div className="stack">
+              <Notice tone="warn">Darás acceso de <strong>solo lectura</strong> durante <strong>2 horas</strong> a pedidos (sin datos personales), estado del restaurante y avisos de pago.</Notice>
+              <div className="row row--wrap">
+                <button className="btn btn--primary" disabled={busy} onClick={() => run(() => data.decideSupport(g.id, true), 'Acceso aprobado durante 2 horas')}>Sí, aprobar</button>
+                <button className="btn btn--ghost" onClick={() => setConfirming(null)}>Volver</button>
+              </div>
+            </div>
+          ) : (
+            <div className="row row--wrap">
+              <button className="btn btn--primary" disabled={busy} onClick={() => setConfirming(g.id)}>Aprobar…</button>
+              <button className="btn btn--outline" disabled={busy} onClick={() => run(() => data.decideSupport(g.id, false), 'Solicitud rechazada')}>Rechazar</button>
+            </div>
+          )}
+        </section>
+      ))}
+      {!active.length && !pending.length && !loading && <p className="muted">No hay solicitudes pendientes ni accesos activos.</p>}
+      <section className="card">
+        <h3 className="card__title">Historial</h3>
+        <SupportHistory grants={past} />
+      </section>
+    </div>
+  );
+}
+
+type SupportViewKind = 'estado' | 'pedidos' | 'avisos';
+
+/** Plataforma: solicitar acceso y, si el propietario lo aprueba, consultar en solo lectura. */
+function SupportRequestPanel({ restaurant }: { restaurant: Restaurant }) {
+  const toast = useToast();
+  const now = useNow(30000);
+  const { value: mine = [], loading, error, reload } = useMySupportRequests(true);
+  const grants = mine.filter((g) => g.restaurantId === restaurant.id);
+  const active = grants.find((g) => isSupportActive(g, now));
+  const pending = grants.find((g) => g.status === 'pendiente');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [view, setView] = useState<{ kind: SupportViewKind; data: unknown } | null>(null);
+
+  const run = async (fn: () => Promise<void>, ok?: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      if (ok) toast(ok);
+    } catch (e) {
+      toast((e as Error).message, 'danger');
+      setView(null);
+    } finally {
+      setBusy(false);
+      reload();
+    }
+  };
+  const load = (kind: SupportViewKind) =>
+    run(async () => {
+      const d = kind === 'estado' ? await data.supportViewRestaurant(restaurant.id)
+        : kind === 'pedidos' ? await data.supportViewOrders(restaurant.id)
+          : await data.supportViewPaymentEvents(restaurant.id);
+      setView({ kind, data: d });
+    });
+
+  return (
+    <div className="stack-lg">
+      <Notice>
+        Acceso de <strong>solo lectura</strong>, solo a este restaurante, durante <strong>2 horas</strong> desde que su propietario lo
+        apruebe. El propietario puede revocarlo y ve cada consulta en su Registro.
+      </Notice>
+      {error && <Notice tone="danger">{error}</Notice>}
+      {loading && !mine.length ? <Spinner /> : active ? (
+        <section className="card stack">
+          <h3 className="card__title">Acceso activo · quedan {remainingLabel(active.expiresAt!, now)}</h3>
+          <p className="muted small">Aprobado por {active.decidedByEmail} · caduca a las {formatTime(active.expiresAt!)}</p>
+          <div className="row row--wrap">
+            <button className="btn btn--outline btn--sm" disabled={busy} onClick={() => load('estado')}>Estado del restaurante</button>
+            <button className="btn btn--outline btn--sm" disabled={busy} onClick={() => load('pedidos')}>Últimos pedidos</button>
+            <button className="btn btn--outline btn--sm" disabled={busy} onClick={() => load('avisos')}>Avisos de pago</button>
+            <button className="btn btn--ghost btn--sm" disabled={busy} onClick={() => run(async () => { await data.cancelSupport(active.id); setView(null); }, 'Acceso terminado')}>Terminar acceso</button>
+          </div>
+          {view && <SupportViewResult kind={view.kind} data={view.data} />}
+        </section>
+      ) : pending ? (
+        <section className="card stack">
+          <h3 className="card__title">Pendiente de aprobación del propietario</h3>
+          <p className="muted">Motivo: {pending.reason}</p>
+          <button className="btn btn--ghost" disabled={busy} onClick={() => run(() => data.cancelSupport(pending.id), 'Solicitud retirada')}>Retirar solicitud</button>
+        </section>
+      ) : (
+        <form className="card stack" onSubmit={(e) => { e.preventDefault(); void run(async () => { await data.requestSupport(restaurant.id, reason); setReason(''); }, 'Solicitud enviada al propietario'); }}>
+          <h3 className="card__title">Solicitar acceso de soporte</h3>
+          <label className="field"><span>Motivo (lo verá el propietario)</span>
+            <textarea id="support-reason" rows={3} maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Ej.: los pedidos no llegan a cocina desde esta mañana" />
+          </label>
+          <button className="btn btn--primary" type="submit" disabled={busy || reason.trim().length < 10}>Enviar solicitud</button>
+        </form>
+      )}
+      <section className="card">
+        <h3 className="card__title">Mis solicitudes para este restaurante</h3>
+        <SupportHistory grants={grants.filter((g) => g !== active && g !== pending)} />
+      </section>
+    </div>
+  );
+}
+
+function SupportViewResult({ kind, data: d }: { kind: SupportViewKind; data: unknown }) {
+  if (kind === 'estado') {
+    const v = d as SupportRestaurantView;
+    return (
+      <div className="stack small">
+        <p><strong>{v.restaurant.name}</strong> · {v.restaurant.suspended ? 'suspendido' : v.restaurant.active ? 'abierto' : 'cerrado'} ·
+          recogida {v.restaurant.pickupEnabled ? 'sí' : 'no'} · caja {v.restaurant.counterPaymentEnabled ? 'sí' : 'no'} · online {v.restaurant.onlinePaymentEnabled ? 'sí' : 'no'}</p>
+        <p>Carta: {v.menu.products} productos ({v.menu.unavailable} agotados) en {v.menu.categories} categorías</p>
+        <p>Equipo: {Object.entries(v.staff).map(([r, n]) => `${roleLabel[r as StaffRole] ?? r}: ${n}`).join(' · ') || 'sin personal'}</p>
+        <p>Pedidos: {v.orders.last24h} en 24 h · {v.orders.inProgress} en curso · {v.orders.pendingOnline} pago online pendiente · {v.orders.pendingCounter} por cobrar
+          {v.orders.lastOrderAt ? ` · último a las ${formatTime(v.orders.lastOrderAt)}` : ''}</p>
+      </div>
+    );
+  }
+  if (kind === 'pedidos') {
+    const rows = d as SupportOrderView[];
+    if (!rows.length) return <p className="muted small">Sin pedidos.</p>;
+    return (
+      <ul className="audit">
+        {rows.map((o) => (
+          <li key={o.number} className="audit__row">
+            <strong className="mono">{orderCode(o.number)} · {formatTime(o.createdAt)} · {o.mode === 'mesa' ? `Mesa ${o.table}` : 'Recoger'}</strong>
+            <span className="small">{prepLabel[o.prepStatus].label} · {paymentLabel[o.paymentStatus].label} · {formatPrice(o.total)}
+              {o.hasNotes ? ' · con notas (ocultas)' : ''}</span>
+            <span className="muted small">{o.items.map((i) => `${i.quantity}× ${i.name}`).join(', ')}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  const rows = d as SupportPaymentEventView[];
+  if (!rows.length) return <p className="muted small">Sin avisos de pago.</p>;
+  return (
+    <ul className="audit">
+      {rows.map((e, i) => (
+        <li key={i} className="audit__row">
+          <strong>{e.outcome} · {e.resolution}</strong>
+          <span className="small">{new Date(e.createdAt).toLocaleString('es-ES')}{e.orderNumber ? ` · pedido ${orderCode(e.orderNumber)}` : ''}{e.amount != null ? ` · ${formatPrice(e.amount)}` : ''}</span>
+          {e.detail && <span className="muted small">{e.detail}</span>}
+        </li>
+      ))}
+    </ul>
   );
 }

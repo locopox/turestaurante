@@ -794,6 +794,211 @@ set role anon;
 select tests.throws(format('select * from public.audit_list(%L, 10)', tests.piazza()), 'permission denied', 'anónimo: no lee el registro');
 reset role;
 
+
+-- ===================== 13. MODO SOPORTE (FASE 4) =====================
+select tests.claims(null, null);
+create function tests.g_status(gid uuid) returns text language sql as $$
+  select private.support_status(status, expires_at) from private.support_grants where id = gid $$;
+create function tests.gid(k text) returns uuid language sql stable as $$ select (val #>> '{}')::uuid from tests.vars where key = k $$;
+
+-- 13.1 Sin solicitud ni aprobación no hay acceso
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'soporte: sin aprobación no hay acceso a pedidos');
+select tests.throws(format('select public.support_view_restaurant(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'soporte: sin aprobación no hay acceso al estado');
+select tests.throws(format('select public.support_request(%L, %L)', tests.piazza(), 'corto'), 'de 10 a 300', 'soporte: la solicitud exige un motivo');
+insert into tests.vars select 'g1', to_jsonb(public.support_request(tests.piazza(), 'Incidencia: los pedidos no llegan a cocina'));
+select tests.throws(format('select public.support_request(%L, %L)', tests.piazza(), 'Otra solicitud para lo mismo'), 'pendiente o un acceso activo', 'soporte: no se acumulan solicitudes');
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'soporte: una solicitud pendiente no da acceso');
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: la plataforma no aprueba su propia solicitud');
+select tests.claims('authenticated', tests.u('ae'));
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: otra cuenta de plataforma no aprueba');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws(format('select public.support_request(%L, %L)', tests.piazza(), 'Quiero ver mis propios pedidos'), 'Solo la plataforma', 'soporte: el personal no solicita accesos de soporte');
+select tests.claims('authenticated', tests.u('a2'));
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: el encargado no aprueba');
+select tests.throws(format('select * from public.support_list_for_restaurant(%L)', tests.piazza()), 'Solo el propietario', 'soporte: el encargado no ve las solicitudes');
+select tests.claims('authenticated', tests.u('a3'));
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: sala no aprueba');
+select tests.claims('authenticated', tests.u('b1'));
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: el propietario de otro restaurante no aprueba');
+select tests.throws(format('select * from public.support_list_for_restaurant(%L)', tests.piazza()), 'Solo el propietario', 'soporte: otro restaurante no ve las solicitudes');
+
+-- 13.2 El propietario ve y aprueba: 2 horas exactas
+select tests.claims('authenticated', tests.u('a1'));
+select tests.ok(exists (select 1 from public.support_list_for_restaurant(tests.piazza())
+  where id = tests.gid('g1') and status = 'pendiente' and requested_by_email = 'admin@plataforma.test'
+  and reason like 'Incidencia%'), 'soporte: el propietario ve la solicitud, quién la pide y el motivo');
+select public.support_decide(tests.gid('g1'), true);
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'ya no está pendiente', 'soporte: no se aprueba dos veces');
+reset role;
+select tests.ok((select expires_at - decided_at = interval '2 hours' and decided_by = tests.u('a1') and decided_by_email = 'owner@piazza.test'
+  from private.support_grants where id = tests.gid('g1')), 'soporte: dura exactamente 2 horas desde la aprobación y registra quién aprobó');
+
+-- 13.3 Consultas de solo lectura, sin datos personales y registradas
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'sv_orders', public.support_view_orders(tests.piazza(), 20);
+insert into tests.vars select 'sv_estado', public.support_view_restaurant(tests.piazza());
+insert into tests.vars select 'sv_pagos', public.support_view_payment_events(tests.piazza());
+select tests.ok(jsonb_array_length(tests.v('sv_orders')) >= 3, 'soporte: consulta los pedidos del restaurante');
+select tests.ok(not exists (select 1 from jsonb_array_elements(tests.v('sv_orders')) t
+  where t ? 'customerName' or t ? 'customerPhone' or t ? 'notes' or t ? 'paymentRef' or t ? 'id'),
+  'soporte: los pedidos no incluyen nombre, teléfono, notas ni referencia de pago');
+select tests.ok(exists (select 1 from jsonb_array_elements(tests.v('sv_orders')) t, jsonb_array_elements(t -> 'items') i
+  where not (i ? 'notes') and i ? 'hasNotes'), 'soporte: las líneas indican si hay notas, sin mostrarlas');
+select tests.ok(tests.v('sv_estado') -> 'staff' ? 'owner' and tests.v('sv_estado')::text not like '%@%',
+  'soporte: el estado resume el equipo por funciones, sin emails');
+select tests.ok((tests.v('sv_estado') ->> 'expiresAt') is not null, 'soporte: el estado indica cuándo caduca el acceso');
+select tests.ok(jsonb_typeof(tests.v('sv_pagos')) = 'array', 'soporte: consulta los avisos de pago');
+select tests.ok((select count(*) from public.support_view_orders(tests.piazza(), 1000) x) = 1
+  and jsonb_array_length(public.support_view_orders(tests.piazza(), 1000)) <= 100, 'soporte: como máximo 100 pedidos por consulta');
+-- Solo lectura: ninguna vía de escritura ni de lectura directa
+select tests.ok((select count(*) from public.orders) = 0 and (select count(*) from public.order_items) = 0, 'soporte: sigue sin leer las tablas de pedidos');
+select tests.throws('select * from private.support_grants', 'permission denied', 'soporte: no lee la tabla de accesos');
+select tests.throws(format('select public.kitchen_orders(%L)', tests.piazza()), 'No tienes acceso', 'soporte: no ve la cocina');
+select tests.throws(format('select public.staff_set_prep_status(%L, %L)', tests.id('o_rec'), 'listo'), 'no encontrado', 'soporte: no cambia la preparación');
+select tests.throws(format('select public.staff_mark_paid_at_counter(%L)', tests.id('o_rec')), 'no encontrado', 'soporte: no registra cobros');
+select tests.ok(tests.affected(format('update public.products set price_cents = 1 where restaurant_id = %L', tests.piazza())) = 0, 'soporte: no cambia precios');
+select tests.throws(format('insert into public.categories (restaurant_id, name) values (%L, %L)', tests.piazza(), 'X'), 'row-level security', 'soporte: no crea productos ni categorías');
+select tests.throws(format('select public.staff_add_member(%L, %L, %L)', tests.piazza(), 'admin@plataforma.test', 'owner'), 'propio acceso', 'soporte: no se convierte en personal');
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g1')), 'Solo el propietario', 'soporte: no puede ampliar ni reaprobar su acceso');
+-- Aislamiento: el acceso es solo para ese restaurante y esa cuenta
+select tests.throws(format('select public.support_view_orders(%L)', tests.otro()), 'No tienes un acceso de soporte activo', 'soporte: el acceso de La Piazza no sirve para otro restaurante');
+select tests.claims('authenticated', tests.u('ae'));
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'soporte: otra cuenta de plataforma no usa el acceso ajeno');
+select tests.throws(format('select public.support_cancel(%L)', tests.gid('g1')), 'Solicitud no encontrada', 'soporte: otra cuenta de plataforma no cancela solicitudes ajenas');
+select tests.claims('authenticated', tests.u('a4'));
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'soporte: el personal no usa las funciones de soporte');
+reset role;
+select tests.ok((select count(*) from private.audit_log where action = 'soporte.consulta' and actor_user_id = tests.u('ad')
+  and target_id = tests.gid('g1')::text and details ->> 'consulta' in ('pedidos', 'estado', 'avisos_pago')) >= 3,
+  'soporte: cada consulta queda registrada con el acceso y lo consultado');
+select tests.ok(not exists (select 1 from public.restaurant_staff where user_id = tests.u('ad')), 'soporte: aprobar no convierte a la plataforma en personal');
+
+-- 13.4 Caducidad: al pasar las 2 horas no hay acceso, aunque la sesión siga abierta
+select tests.claims(null, null);
+update private.support_grants set decided_at = decided_at - interval '3 hours', expires_at = expires_at - interval '3 hours' where id = tests.gid('g1');
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'caducidad: sin acceso tras 2 horas');
+select tests.ok(exists (select 1 from public.support_my_requests() where id = tests.gid('g1') and status = 'caducada'), 'caducidad: la plataforma ve su acceso como caducado');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws(format('select public.support_revoke(%L)', tests.gid('g1')), 'ya no está activo', 'caducidad: no se revoca un acceso caducado');
+reset role;
+select tests.claims(null, null);
+select tests.throws(format('update private.support_grants set expires_at = now() + interval %L where id = %L', '1 day', tests.gid('g1')), 'no se puede ampliar|violates check', 'caducidad: nadie puede ampliar un acceso');
+select tests.throws(format('update private.support_grants set decided_at = now(), expires_at = now() + interval %L where id = %L', '2 hours', tests.gid('g1')),
+  'no se puede ampliar', 'caducidad: no se reactiva un acceso caducado (ni desde el SQL Editor)');
+select tests.ok(tests.g_status(tests.gid('g1')) = 'caducada', 'caducidad: sigue caducado tras los intentos');
+select tests.throws($$insert into private.support_grants (restaurant_id, requested_by, requested_by_email, reason, status, decided_at, expires_at)
+  values ('5e5e0000-0000-4000-8000-000000000001', 'a0000000-0000-4000-8000-0000000000ad', 'x', 'Acceso directo sin aprobar', 'aprobada', now(), now() + interval '2 hours')$$,
+  'siempre empieza pendiente', 'nadie crea un acceso ya aprobado (ni desde el SQL Editor)');
+select tests.throws(format('delete from private.support_grants where id = %L', tests.gid('g1')), 'no se puede borrar', 'el historial de accesos no se puede borrar');
+
+-- 13.5 Rechazo
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'g2', to_jsonb(public.support_request(tests.piazza(), 'Revisar configuración de pagos'));
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select public.support_decide(tests.gid('g2'), false);
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'rechazo: una solicitud rechazada no da acceso');
+reset role;
+select tests.ok(tests.g_status(tests.gid('g2')) = 'rechazada', 'rechazo: queda como rechazada');
+
+-- 13.6 Revocación: efecto inmediato en la misma sesión
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'g3', to_jsonb(public.support_request(tests.piazza(), 'Diagnóstico de pedidos duplicados'));
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select public.support_decide(tests.gid('g3'), true);
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.ok(jsonb_typeof(public.support_view_orders(tests.piazza(), 5)) = 'array', 'revocación: antes de revocar, hay acceso');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select public.support_revoke(tests.gid('g3'));
+reset role;
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'revocación: sin acceso inmediatamente después');
+select tests.throws(format('select public.support_view_restaurant(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'revocación: ninguna consulta funciona');
+reset role;
+select tests.ok((select status = 'revocada' and revoked_by = tests.u('a1') and revoked_at is not null from private.support_grants where id = tests.gid('g3')),
+  'revocación: registra quién revocó y cuándo');
+
+-- 13.7 Cancelación por quien lo pidió y requisito de seguir siendo plataforma
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'g4', to_jsonb(public.support_request(tests.piazza(), 'Solicitud que ya no hace falta'));
+select public.support_cancel(tests.gid('g4'));
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws(format('select public.support_decide(%L, true)', tests.gid('g4')), 'ya no está pendiente', 'cancelación: una solicitud cancelada no se puede aprobar');
+reset role;
+select tests.claims('authenticated', tests.u('ae'));
+set role authenticated;
+insert into tests.vars select 'g5', to_jsonb(public.support_request(tests.otro(), 'Incidencia en cobros online'));
+reset role;
+select tests.claims('authenticated', tests.u('b1'));
+set role authenticated;
+select public.support_decide(tests.gid('g5'), true);
+reset role;
+select tests.claims('authenticated', tests.u('ae'));
+set role authenticated;
+select tests.ok(jsonb_typeof(public.support_view_payment_events(tests.otro())) = 'array', 'otro restaurante: su propietario concede su propio acceso');
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'No tienes un acceso de soporte activo', 'otro restaurante: ese acceso no sirve para La Piazza');
+reset role;
+select tests.claims(null, null);
+delete from public.platform_admins where user_id = tests.u('ae');
+select tests.claims('authenticated', tests.u('ae'));
+set role authenticated;
+select tests.throws(format('select public.support_view_orders(%L)', tests.otro()), 'No tienes un acceso de soporte activo', 'quien deja de ser plataforma pierde el acceso al momento');
+reset role;
+
+-- 13.8 Registro completo y visibilidad para el propietario
+select tests.claims(null, null);
+select tests.ok(tests.logged(tests.piazza(), 'soporte.solicitud') and tests.logged(tests.piazza(), 'soporte.aprobacion')
+  and tests.logged(tests.piazza(), 'soporte.rechazo') and tests.logged(tests.piazza(), 'soporte.revocacion')
+  and tests.logged(tests.piazza(), 'soporte.cancelacion') and tests.logged(tests.piazza(), 'soporte.caducidad_adelantada'),
+  'registro: solicitud, aprobación, rechazo, revocación, cancelación y cambios de caducidad');
+select tests.ok(exists (select 1 from private.audit_log where action = 'soporte.solicitud' and actor_user_id = tests.u('ad') and details ->> 'motivo' like 'Incidencia%'),
+  'registro: quién solicitó y con qué motivo');
+select tests.ok(exists (select 1 from private.audit_log where action = 'soporte.aprobacion' and actor_user_id = tests.u('a1')
+  and details ? 'inicio' and details ? 'caduca'), 'registro: quién aprobó, inicio y caducidad');
+select tests.ok(exists (select 1 from private.audit_log where action = 'soporte.revocacion' and actor_user_id = tests.u('a1') and details ? 'fin'),
+  'registro: quién revocó y cuándo');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok((select count(*) from public.audit_list(tests.piazza(), 500) where action = 'soporte.consulta') >= 3,
+  'el propietario ve en su registro cada consulta de soporte');
+select tests.ok(not exists (select 1 from public.audit_list(tests.piazza(), 500) where details ->> 'motivo' = 'Incidencia en cobros online'),
+  'el registro de La Piazza no incluye el soporte de otro restaurante');
+reset role;
+select tests.claims('anon', null);
+set role anon;
+select tests.throws(format('select public.support_request(%L, %L)', tests.piazza(), 'Intento anónimo de soporte'), 'permission denied', 'anónimo: no usa el modo soporte');
+select tests.throws(format('select public.support_view_orders(%L)', tests.piazza()), 'permission denied', 'anónimo: no consulta datos de soporte');
+reset role;
+select tests.claims('authenticated', tests.u('ee'));
+set role authenticated;
+select tests.throws('select * from public.support_my_requests()', 'Solo la plataforma', 'sin rol: no tiene solicitudes de soporte');
+reset role;
+
 -- ===================== Resultado =====================
 \o
 \set QUIET 0

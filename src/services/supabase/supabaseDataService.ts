@@ -1,6 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { friendlyAuthError, parseAuthRedirect, PASSWORD_MIN, type AuthRedirect } from '../../lib/authRedirect';
-import type { AuditEntry, Category, KitchenTicket, Order, Product, Restaurant, StaffMember, StaffRole, StaffSession } from '../../types';
+import type {
+  AuditEntry, Category, KitchenTicket, Order, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant,
+  SupportOrderView, SupportPaymentEventView, SupportRestaurantView,
+} from '../../types';
 import type { DataService, Menu } from '../dataService';
 
 /**
@@ -402,6 +405,46 @@ export class SupabaseDataService implements DataService {
   setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string) {
     return this.rpcVoid('platform_set_suspension', { p_restaurant_id: restaurantId, p_suspended: suspended, p_reason: reason });
   }
+  // ---------- Modo soporte ----------
+  private toGrant = (g: Row): SupportGrant => ({
+    id: g.id, restaurantId: g.restaurant_id ?? null, restaurantName: g.restaurant_name ?? null,
+    requestedByEmail: g.requested_by_email ?? null, reason: g.reason, status: g.status, requestedAt: g.requested_at,
+    decidedAt: g.decided_at ?? null, decidedByEmail: g.decided_by_email ?? null, expiresAt: g.expires_at ?? null,
+    revokedAt: g.revoked_at ?? null,
+  });
+  private async rpcData<T>(fn: string, args?: Record<string, unknown>): Promise<T> {
+    const { data, error } = await (await this.client).rpc(fn, args);
+    if (error) throw new Error(friendly(error.message));
+    return data as T;
+  }
+  async requestSupport(restaurantId: string, reason: string) {
+    await this.rpcData('support_request', { p_restaurant_id: restaurantId, p_reason: reason.trim() });
+  }
+  async listSupportRequests(restaurantId: string) {
+    return ((await this.rpcData<Row[]>('support_list_for_restaurant', { p_restaurant_id: restaurantId })) ?? []).map(this.toGrant);
+  }
+  async mySupportRequests() {
+    return ((await this.rpcData<Row[]>('support_my_requests')) ?? []).map(this.toGrant);
+  }
+  decideSupport(grantId: string, approve: boolean) {
+    return this.rpcVoid('support_decide', { p_grant_id: grantId, p_approve: approve });
+  }
+  revokeSupport(grantId: string) {
+    return this.rpcVoid('support_revoke', { p_grant_id: grantId });
+  }
+  cancelSupport(grantId: string) {
+    return this.rpcVoid('support_cancel', { p_grant_id: grantId });
+  }
+  supportViewRestaurant(restaurantId: string) {
+    return this.rpcData<SupportRestaurantView>('support_view_restaurant', { p_restaurant_id: restaurantId });
+  }
+  async supportViewOrders(restaurantId: string) {
+    return (await this.rpcData<SupportOrderView[]>('support_view_orders', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
+  }
+  async supportViewPaymentEvents(restaurantId: string) {
+    return (await this.rpcData<SupportPaymentEventView[]>('support_view_payment_events', { p_restaurant_id: restaurantId, p_limit: 50 })) ?? [];
+  }
+
   async listAudit(restaurantId: string | null): Promise<AuditEntry[]> {
     const { data, error } = await (await this.client).rpc('audit_list', { p_restaurant_id: restaurantId, p_limit: 200 });
     if (error) throw new Error(friendly(error.message));
