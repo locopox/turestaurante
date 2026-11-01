@@ -122,12 +122,28 @@ supabase/
 
 En el modo demo el soporte no está disponible: necesita cuentas reales de plataforma y de propietario separadas.
 
-### Invitaciones (fase 6 · E1 base de datos y E2 Edge Function)
+### Invitaciones (fase 6 · E1 base de datos, E2 Edge Functions, E3 interfaz)
 
-Hechas la base de datos (E1) y la Edge Function `invitations` (E2, ver
-[`supabase/functions/invitations/README.md`](supabase/functions/invitations/README.md)), sin desplegar. Las
-pantallas (E3) llegarán después: **mientras tanto, «Añadir al equipo» de la app no funciona con Supabase** (ya no
-existe `staff_add_member`).
+Hechas la base de datos (E1), las Edge Functions `invitations` e `invitations-recovery` (E2, ver
+[`supabase/functions/invitations/README.md`](supabase/functions/invitations/README.md)) y la interfaz (E3), sin
+desplegar.
+
+**En la app:**
+
+- **Administración → Equipo**: «Invitar al equipo» (sustituye a «Añadir al equipo»). Cada rol ve solo las funciones
+  que puede dar; la lista muestra el estado de cada invitación (pendiente, aceptada, rechazada, caducada, revocada),
+  quién invitó, la caducidad y los reenvíos. Reenviar (pasados 5 minutos, máximo 3) y revocar solo aparecen si el
+  servidor dice que esa persona puede gestionarla. Nunca se muestra si el correo tenía cuenta ni si se envió: eso solo
+  lo ve la plataforma, en «Entregas de correo».
+- **Nuevo restaurante** (plataforma): pide el correo del primer propietario; el restaurante nace cerrado.
+- **Invitaciones** (`#invitaciones`): cada persona ve las suyas y las acepta o rechaza. La función es la de la
+  invitación (no se elige) y no se da por aceptada hasta que el servidor lo confirma; entonces se abre ese restaurante.
+  Aviso en las pantallas del personal cuando hay invitaciones pendientes.
+- **Correo de invitación** (cuenta nueva): el enlace lleva a «Elige tu contraseña» (el correo ya queda confirmado) y,
+  después, a la invitación. Hasta elegirla no se puede usar nada más.
+- **Varios restaurantes**: el selector muestra solo los restaurantes de la cuenta, con su función en cada uno
+  («La Piazza · Sala»); los permisos son los de ese restaurante.
+- En el **modo demo** no hay cuentas ni correos: las pantallas lo explican y el resto funciona igual.
 
 - **Nadie tiene permisos antes de aceptar.** La invitación vive en `private.invitations` (no accesible por la API)
   y ninguna comprobación de permisos la lee. El único alta en un equipo es `invitation_accept(id)`, que exige:

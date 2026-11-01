@@ -1,7 +1,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { friendlyAuthError, parseAuthRedirect, PASSWORD_MIN, type AuthRedirect } from '../../lib/authRedirect';
 import type {
-  AuditEntry, Category, KitchenTicket, Order, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant,
+  AuditEntry, Category, Invitation, InvitationSent, KitchenTicket, MyInvitation, Order, Product, Restaurant, StaffMember,
+  StaffRole, StaffSession, SupportGrant,
   SupportDenial, SupportDenialReason, SupportOrderView, SupportPaymentEventView, SupportRestaurantView,
 } from '../../types';
 
@@ -108,8 +109,10 @@ function browserEnv(): BrowserEnv | null {
   return { location: window.location, history: window.history, storage };
 }
 
-/** Marca de «recuperación pendiente», solo para esta pestaña (sessionStorage). */
+/** Marca de «contraseña pendiente» (recuperación o invitación), solo para esta pestaña (sessionStorage).
+ *  Valores: '1' o 'recovery' (recuperación) e 'invite' (cuenta nueva desde una invitación). */
 const RECOVERY_KEY = 'turestaurante:recuperar-contrasena';
+type SetupKind = 'recovery' | 'invite';
 
 export class SupabaseDataService implements DataService {
   readonly kind = 'supabase' as const;
@@ -124,6 +127,7 @@ export class SupabaseDataService implements DataService {
     // Se lee ANTES de crear el cliente: supabase-js borra los datos del enlace al procesarlo.
     this.redirect = this.env ? parseAuthRedirect(this.env.location.hash, this.env.location.search) : { kind: 'none' };
     if (this.redirect.kind === 'recovery') this.setRecoveryFlag(true);
+    if (this.redirect.kind === 'invite') this.setRecoveryFlag('invite');
     if (this.redirect.kind === 'error' && this.env?.history) {
       // Quita el error de la dirección para que no se repita al recargar.
       this.env.history.replaceState(this.env.history.state, '', this.env.location.pathname);
@@ -152,16 +156,19 @@ export class SupabaseDataService implements DataService {
   private emitAuth() {
     this.authListeners.forEach((l) => l());
   }
-  private setRecoveryFlag(on: boolean) {
+  private setRecoveryFlag(on: boolean | SetupKind) {
+    const kind: SetupKind | null = on === true ? 'recovery' : on === false ? null : on;
+    // Una invitación pendiente no se convierte en recuperación por el evento PASSWORD_RECOVERY.
+    if (kind === 'recovery' && this.getPasswordSetupKind() === 'invite') return;
     try {
-      if (on) this.env?.storage?.setItem(RECOVERY_KEY, '1');
+      if (kind) this.env?.storage?.setItem(RECOVERY_KEY, kind);
       else this.env?.storage?.removeItem(RECOVERY_KEY);
     } catch {
       /* sin almacenamiento: solo dura mientras la página esté abierta */
     }
-    this.recoveryInMemory = on;
+    this.setupInMemory = kind;
   }
-  private recoveryInMemory = false;
+  private setupInMemory: SetupKind | null = null;
 
   // ---------- Sesión del personal ----------
   async getSession(): Promise<StaffSession | null> {
@@ -207,13 +214,16 @@ export class SupabaseDataService implements DataService {
     this.emitAuth();
   }
   isPasswordRecoveryPending() {
+    return this.getPasswordSetupKind() !== null;
+  }
+  getPasswordSetupKind(): SetupKind | null {
     try {
       const stored = this.env?.storage?.getItem(RECOVERY_KEY);
-      if (stored != null) return stored === '1';
+      if (stored != null) return stored === 'invite' ? 'invite' : stored === '1' || stored === 'recovery' ? 'recovery' : null;
     } catch {
       /* usar el valor en memoria */
     }
-    return this.recoveryInMemory;
+    return this.setupInMemory;
   }
   async setNewPassword(newPassword: string) {
     if (newPassword.length < PASSWORD_MIN) throw new Error(`La contraseña debe tener al menos ${PASSWORD_MIN} caracteres.`);
@@ -279,6 +289,9 @@ export class SupabaseDataService implements DataService {
     const { data, error } = await (await this.client).from('restaurants').select('*').eq('slug', slug).maybeSingle();
     if (error) throw new Error(friendly(error.message));
     return data ? toRestaurant(data) : null;
+  }
+  async createRestaurantWithOwner(input: { name: string; slug: string; ownerEmail: string }) {
+    return this.invokeInvitations({ action: 'create_restaurant', name: input.name.trim(), slug: input.slug, ownerEmail: input.ownerEmail.trim() });
   }
   async createRestaurant(input: Parameters<DataService['createRestaurant']>[0]) {
     return this.one((await this.client).from('restaurants').insert(fromRestaurant(input)).select().single(), toRestaurant);
@@ -351,12 +364,16 @@ export class SupabaseDataService implements DataService {
     throw new Error('Con Supabase, el estado del pago solo lo actualiza el servidor tras la confirmación del proveedor de pagos.');
   }
 
+  private channelSeq = 0;
   private listen(name: string, tables: { table: string; filter?: string }[], onChange: () => void) {
     let cleanup = () => {};
     let closed = false;
+    // Un canal propio por suscripción: supabase-js reutiliza el canal si el nombre coincide y no
+    // admite añadirle escuchas después de subscribe() (pasaba al volver a una pantalla).
+    const channelName = `${name}:${++this.channelSeq}`;
     this.client.then((sb) => {
       if (closed) return;
-      let ch = sb.channel(name);
+      let ch = sb.channel(channelName);
       for (const t of tables) ch = ch.on('postgres_changes', { event: '*', schema: 'public', ...t }, onChange);
       ch.subscribe();
       cleanup = () => void sb.removeChannel(ch);
@@ -405,14 +422,71 @@ export class SupabaseDataService implements DataService {
     if (error) throw new Error(friendly(error.message));
     return ((data ?? []) as Row[]).map((m) => ({ userId: m.user_id, email: m.email, role: m.role, isMe: !!m.is_me }));
   }
-  addStaff(restaurantId: string, email: string, role: StaffRole) {
-    return this.rpcVoid('staff_add_member', { p_restaurant_id: restaurantId, p_email: email.trim(), p_role: role });
-  }
   changeStaffRole(restaurantId: string, userId: string, role: StaffRole) {
     return this.rpcVoid('staff_change_role', { p_restaurant_id: restaurantId, p_user_id: userId, p_role: role });
   }
   removeStaff(restaurantId: string, userId: string) {
     return this.rpcVoid('staff_remove_member', { p_restaurant_id: restaurantId, p_user_id: userId });
+  }
+
+  // ---------- Invitaciones ----------
+  /**
+   * Edge Function «invitations» (crear, crear restaurante, reenviar). supabase-js envía el JWT de la
+   * sesión: la función comprueba la identidad y deja que SQL decida los permisos. La clave secreta
+   * vive solo en el servidor. La respuesta es la misma tenga o no cuenta el correo.
+   */
+  private async invokeInvitations(body: Record<string, unknown>): Promise<InvitationSent> {
+    const sb = await this.client;
+    const { data, error } = await sb.functions.invoke('invitations', { body });
+    if (error) {
+      let message = 'No se ha podido completar la invitación. Inténtalo de nuevo.';
+      const ctx = (error as { context?: unknown }).context as { json?: () => Promise<unknown> } | undefined;
+      if (ctx && typeof ctx.json === 'function') {
+        try {
+          const j = (await ctx.json()) as { error?: unknown };
+          if (typeof j?.error === 'string' && j.error) message = j.error;
+        } catch {
+          /* respuesta sin JSON: mensaje general */
+        }
+      } else if (/Failed to (fetch|send)|NetworkError|fetch failed|FunctionsFetchError|FunctionsRelayError/i.test(`${error.name} ${error.message}`)) {
+        message = 'No hay conexión con el servidor. Inténtalo de nuevo.';
+      }
+      throw new Error(message);
+    }
+    const r = (data ?? {}) as { ok?: boolean; invitationId?: string; restaurantId?: string; message?: string };
+    if (r.ok !== true || !r.invitationId) throw new Error('No se ha podido completar la invitación. Inténtalo de nuevo.');
+    return { invitationId: r.invitationId, ...(r.restaurantId ? { restaurantId: r.restaurantId } : {}), message: r.message ?? '' };
+  }
+  inviteStaff(restaurantId: string, email: string, role: StaffRole) {
+    return this.invokeInvitations({ action: 'create', restaurantId, email: email.trim(), role });
+  }
+  resendInvitation(invitationId: string) {
+    return this.invokeInvitations({ action: 'resend', invitationId });
+  }
+  revokeInvitation(invitationId: string) {
+    return this.rpcVoid('invitation_revoke', { p_invitation_id: invitationId });
+  }
+  async listInvitations(restaurantId: string): Promise<Invitation[]> {
+    return ((await this.rpcData<Row[]>('invitation_list', { p_restaurant_id: restaurantId })) ?? []).map((i) => ({
+      id: i.id, email: i.email, role: i.role, state: i.state, createdAt: i.created_at, expiresAt: i.expires_at,
+      invitedByLabel: i.invited_by_label ?? '', decidedAt: i.decided_at ?? null, resendCount: i.resend_count ?? 0, canManage: !!i.can_manage,
+    }));
+  }
+  async myInvitations(): Promise<MyInvitation[]> {
+    return ((await this.rpcData<Row[]>('my_invitations')) ?? []).map((i) => ({
+      id: i.id, restaurantId: i.restaurant_id, restaurantName: i.restaurant_name, role: i.role, expiresAt: i.expires_at,
+      invitedByLabel: i.invited_by_label ?? '',
+    }));
+  }
+  async acceptInvitation(invitationId: string) {
+    const restaurantId = await this.rpcData<string>('invitation_accept', { p_invitation_id: invitationId });
+    if (!restaurantId) throw new Error('No se ha podido aceptar la invitación. Inténtalo de nuevo.');
+    // Las funciones del usuario han cambiado: la sesión se vuelve a leer (my_memberships).
+    this.emitAuth();
+    return restaurantId;
+  }
+  declineInvitation(invitationId: string) {
+    return this.rpcVoid('invitation_decline', { p_invitation_id: invitationId });
   }
 
   // ---------- Plataforma y auditoría ----------

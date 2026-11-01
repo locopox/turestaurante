@@ -29,6 +29,13 @@ export const auditActionLabel: Record<string, string> = {
   'soporte.caducidad_adelantada': 'Soporte: caducidad adelantada',
   'soporte.consulta': 'Soporte: consulta de datos',
   'plataforma.baja_admin': 'Baja de administrador de plataforma',
+  'invitacion.creada': 'Invitación enviada',
+  'invitacion.reenviada': 'Invitación reenviada',
+  'invitacion.aceptada': 'Invitación aceptada',
+  'invitacion.rechazada': 'Invitación rechazada',
+  'invitacion.revocada': 'Invitación revocada',
+  'invitacion.entrega': 'Entrega del correo de invitación',
+  'plataforma.consulta_invitaciones': 'La plataforma consultó las invitaciones',
 };
 
 const actorKindLabel: Record<AuditEntry['actorKind'], string> = {

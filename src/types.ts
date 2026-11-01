@@ -125,6 +125,42 @@ export interface Membership {
   role: StaffRole;
 }
 
+/** Estado visible de una invitación (invitation_list). «caducada»: pendiente pasados 7 días. */
+export type InvitationState = 'pendiente' | 'aceptada' | 'rechazada' | 'revocada' | 'reemplazada' | 'caducada';
+
+/** Invitación vista por quien gestiona el equipo (owner, manager o plataforma). No incluye nada
+ *  sobre el envío del correo ni sobre si la persona tiene cuenta. */
+export interface Invitation {
+  id: string;
+  email: string;
+  role: StaffRole;
+  state: InvitationState;
+  createdAt: string;
+  expiresAt: string;
+  invitedByLabel: string;
+  decidedAt: string | null;
+  resendCount: number;
+  /** El servidor dice si quien consulta puede reenviarla o revocarla. */
+  canManage: boolean;
+}
+
+/** Invitación que puede aceptar la persona que ha iniciado sesión (my_invitations). */
+export interface MyInvitation {
+  id: string;
+  restaurantId: string;
+  restaurantName: string;
+  role: StaffRole;
+  expiresAt: string;
+  invitedByLabel: string;
+}
+
+/** Respuesta de la Edge Function «invitations» (la misma tenga o no cuenta el correo). */
+export interface InvitationSent {
+  invitationId: string;
+  restaurantId?: string;
+  message: string;
+}
+
 /** Miembro del equipo de un restaurante (staff_list). */
 export interface StaffMember {
   userId: string;

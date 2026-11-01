@@ -7,10 +7,14 @@ export type AuthRedirect =
   | { kind: 'none' }
   /** Enlace de recuperación válido: Supabase abrirá una sesión y hay que pedir la contraseña nueva. */
   | { kind: 'recovery' }
+  /** Enlace de invitación (cuenta nueva o sin confirmar): Supabase confirma el correo y abre una
+   *  sesión; hay que pedir la contraseña antes de nada. NO da ningún permiso: la invitación se acepta
+   *  después, de forma explícita. */
+  | { kind: 'invite' }
   /** Enlace caducado, ya usado o rechazado. */
   | { kind: 'error'; code: string; message: string };
 
-const EXPIRED_MESSAGE = 'El enlace ha caducado o ya se ha usado. Pide uno nuevo desde «¿Has olvidado tu contraseña?».';
+const EXPIRED_MESSAGE = 'El enlace ha caducado o ya se ha usado. Pide uno nuevo desde «¿Has olvidado tu contraseña?» o, si era una invitación, pide que te la reenvíen.';
 
 /**
  * Lee la dirección con la que Supabase devuelve al usuario a la app tras pulsar el enlace del
@@ -34,6 +38,7 @@ export function parseAuthRedirect(hash: string, search = ''): AuthRedirect {
     return { kind: 'error', code, message };
   }
   if (fromHash.get('type') === 'recovery' && fromHash.get('access_token')) return { kind: 'recovery' };
+  if (fromHash.get('type') === 'invite' && fromHash.get('access_token')) return { kind: 'invite' };
   return { kind: 'none' };
 }
 
@@ -73,9 +78,10 @@ export function friendlyAuthError(error: { message?: string; code?: string } | n
 export type StaffGate = 'set-password' | 'loading' | 'login' | 'open';
 
 /**
- * Qué mostrar según la sesión. Con una recuperación pendiente, NADA del personal (panel,
- * cocina, administración) es accesible hasta fijar la contraseña: la sesión abierta por el
- * enlace sirve solo para eso. Después, los permisos de cada rol se aplican como siempre.
+ * Qué mostrar según la sesión. Con una recuperación o una invitación pendiente de contraseña,
+ * NADA del personal (panel, cocina, administración, invitaciones) es accesible hasta fijarla: la
+ * sesión abierta por el enlace sirve solo para eso. Después, los permisos de cada rol se aplican
+ * como siempre.
  */
 export function staffGate(s: {
   isStaffView: boolean;

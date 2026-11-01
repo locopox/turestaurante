@@ -5,7 +5,8 @@ export type Route =
   | { view: 'cliente'; slug?: string; table?: number }
   | { view: 'panel' }
   | { view: 'cocina' }
-  | { view: 'admin' };
+  | { view: 'admin' }
+  | { view: 'invitaciones' };
 
 /**
  * Rutas por hash sencillas (#panel, #cocina, #pedir-la-piazza-mesa-5).
@@ -13,7 +14,7 @@ export type Route =
  */
 export function parseHash(hash: string): Route {
   const h = decodeURIComponent(hash.replace(/^#\/?/, ''));
-  if (h === 'panel' || h === 'cocina' || h === 'admin') return { view: h };
+  if (h === 'panel' || h === 'cocina' || h === 'admin' || h === 'invitaciones') return { view: h };
   if (h === 'cliente') return { view: 'cliente' };
   const m = h.match(/^pedir-(.+?)(?:-mesa-(\d+))?$/);
   if (m) return { view: 'cliente', slug: m[1], table: m[2] ? Number(m[2]) : undefined };

@@ -104,16 +104,16 @@ describe('servicio de Supabase: funciones de equipo, cocina y plataforma (client
     const svc = new SupabaseDataService('https://x.supabase.co', 'sb_publishable_x', { createClient: async () => client, env: null });
     return { svc, calls };
   }
-  it('gestiona el equipo solo con las funciones staff_* (nunca escribe la tabla)', async () => {
+  it('gestiona el equipo solo con las funciones staff_* (nunca escribe la tabla) y sin altas directas', async () => {
     const { svc, calls } = service();
-    await svc.addStaff('A', ' sala@x.test ', 'waiter');
     await svc.changeStaffRole('A', 'u2', 'kitchen');
     await svc.removeStaff('A', 'u2');
     expect(calls).toEqual([
-      { fn: 'staff_add_member', args: { p_restaurant_id: 'A', p_email: 'sala@x.test', p_role: 'waiter' } },
       { fn: 'staff_change_role', args: { p_restaurant_id: 'A', p_user_id: 'u2', p_role: 'kitchen' } },
       { fn: 'staff_remove_member', args: { p_restaurant_id: 'A', p_user_id: 'u2' } },
     ]);
+    // Fase 6: ya no existe ninguna forma de añadir a alguien sin invitación aceptada.
+    expect('addStaff' in svc).toBe(false);
   });
   it('la cocina usa kitchen_orders y la suspensión platform_set_suspension', async () => {
     const { svc, calls } = service({ kitchen_orders: [{ id: 'o1', number: 101, createdAt: 'x', mode: 'mesa', table: 3, prepStatus: 'nuevo', notes: '', items: [{ name: 'Pizza', quantity: 2 }] }] });

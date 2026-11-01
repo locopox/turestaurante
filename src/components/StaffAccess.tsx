@@ -96,7 +96,7 @@ export function LoginScreen({ onSignedIn }: { onSignedIn: () => void }) {
         <button type="button" className="btn btn--ghost btn--block" onClick={() => switchMode(mode === 'login' ? 'forgot' : 'login')}>
           {mode === 'login' ? '¿Has olvidado tu contraseña?' : 'Volver a iniciar sesión'}
         </button>
-        <p className="muted small">Las cuentas las crea el administrador de la plataforma. No hay registro público.</p>
+        <p className="muted small">No hay registro público: se entra por invitación. Si te han invitado, usa el enlace del correo.</p>
       </form>
     </div>
   );
@@ -122,10 +122,12 @@ function NewPasswordFields({ password, repeat, onPassword, onRepeat, idPrefix }:
 }
 
 /**
- * Tras abrir un enlace de recuperación. Bloquea el panel, la cocina y la administración hasta
- * fijar la contraseña: la sesión que abre el enlace solo sirve para esto.
+ * Tras abrir un enlace de recuperación o de invitación. Bloquea el panel, la cocina y la
+ * administración hasta fijar la contraseña: la sesión que abre el enlace solo sirve para esto.
+ * En una invitación, abrir el enlace confirma el correo; elegir la contraseña activa la cuenta.
+ * La invitación se acepta DESPUÉS, de forma explícita.
  */
-export function SetPasswordScreen({ email, onDone }: { email: string; onDone: () => void }) {
+export function SetPasswordScreen({ email, onDone, kind = 'recovery' }: { email: string; onDone: () => void; kind?: 'recovery' | 'invite' }) {
   const toast = useToast();
   const [password, setPassword] = useState('');
   const [repeat, setRepeat] = useState('');
@@ -140,7 +142,7 @@ export function SetPasswordScreen({ email, onDone }: { email: string; onDone: ()
     setError(null);
     try {
       await data.setNewPassword(password);
-      toast('Contraseña guardada');
+      toast(kind === 'invite' ? 'Cuenta activada' : 'Contraseña guardada');
       onDone();
     } catch (err) {
       setError((err as Error).message);
@@ -162,14 +164,27 @@ export function SetPasswordScreen({ email, onDone }: { email: string; onDone: ()
     <div className="page access">
       <form className="access__card stack-lg" onSubmit={submit} noValidate>
         <div>
-          <span className="eyebrow">Recuperar contraseña</span>
-          <h1>Elige una contraseña nueva</h1>
-          <p className="muted">Para la cuenta <strong>{email}</strong>. Hasta que la guardes no podrás usar el panel ni la cocina.</p>
+          {kind === 'invite' ? (
+            <>
+              <span className="eyebrow">Te han invitado a TuRestaurante</span>
+              <h1>Elige tu contraseña</h1>
+              <p className="muted">
+                Tu correo <strong>{email}</strong> ya está confirmado. Elige una contraseña para activar tu cuenta; después verás la
+                invitación y podrás aceptarla o rechazarla.
+              </p>
+            </>
+          ) : (
+            <>
+              <span className="eyebrow">Recuperar contraseña</span>
+              <h1>Elige una contraseña nueva</h1>
+              <p className="muted">Para la cuenta <strong>{email}</strong>. Hasta que la guardes no podrás usar el panel ni la cocina.</p>
+            </>
+          )}
         </div>
         {error && <Notice tone="danger">{error}</Notice>}
         <NewPasswordFields idPrefix="recovery" password={password} repeat={repeat} onPassword={setPassword} onRepeat={setRepeat} />
         <button className="btn btn--primary btn--block btn--lg" type="submit" disabled={busy}>
-          {busy ? 'Guardando…' : 'Guardar contraseña'}
+          {busy ? 'Guardando…' : kind === 'invite' ? 'Activar mi cuenta' : 'Guardar contraseña'}
         </button>
         <button type="button" className="btn btn--ghost btn--block" onClick={cancel} disabled={busy}>
           Ahora no (cerrar sesión)

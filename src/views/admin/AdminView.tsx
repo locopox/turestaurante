@@ -11,6 +11,7 @@ import { formatPrice, formatTime, orderCode, paymentLabel, prepLabel, slugify } 
 import { denialReasonLabel, denialSummary, isSupportActive, remainingLabel, supportStatusLabel } from '../../lib/support';
 import { data } from '../../services';
 import { can, canOpenAdmin, manageableRoles, roleLabel } from '../../lib/permissions';
+import { TeamInvitations } from '../invitations/TeamInvitations';
 import type {
   FoodArt as Art, Product, Restaurant, StaffRole, StaffSession, SupportGrant, SupportOrderView, SupportPaymentEventView,
   SupportRestaurantView,
@@ -105,7 +106,7 @@ export function AdminView({ selectedId, onSelect, session }: { selectedId: strin
           )}
         </div>
       )}
-      <CreateRestaurant open={creating} onClose={() => setCreating(false)} onCreated={(r) => { setCreating(false); onSelect(r.id); setTab('datos'); }} />
+      <CreateRestaurant open={creating} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); if (id) onSelect(id); setTab('equipo'); }} />
     </div>
   );
 }
@@ -238,13 +239,12 @@ function SuspensionPanel({ restaurant }: { restaurant: Restaurant }) {
   );
 }
 
-/** Equipo del restaurante. Cada acción la valida la base de datos (staff_add_member, etc.). */
+/** Equipo del restaurante. Las altas son solo por invitación aceptada; cambios y bajas con
+ *  staff_change_role / staff_remove_member. Cada acción la valida la base de datos. */
 function TeamPanel({ restaurant, session }: { restaurant: Restaurant; session: StaffSession | null }) {
   const toast = useToast();
   const { value: members = [], loading, error, reload } = useStaff(restaurant.id);
   const roles = manageableRoles(session, restaurant.id);
-  const [email, setEmail] = useState('');
-  const [role, setRole] = useState<StaffRole>(roles.includes('waiter') ? 'waiter' : roles[0] ?? 'waiter');
   const [removing, setRemoving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -265,24 +265,14 @@ function TeamPanel({ restaurant, session }: { restaurant: Restaurant; session: S
   return (
     <div className="stack-lg">
       {data.kind === 'mock' && <Notice>En el modo demo no hay cuentas de personal. El equipo se gestiona conectando Supabase.</Notice>}
-      <form className="card stack" onSubmit={(e) => { e.preventDefault(); if (email.trim()) void run(async () => { await data.addStaff(restaurant.id, email, role); setEmail(''); }, 'Persona añadida al equipo'); }}>
-        <h3 className="card__title">Añadir al equipo</h3>
-        <p className="muted small">La cuenta tiene que existir ya (Supabase → Authentication → Users). Las invitaciones por correo llegarán en una fase posterior.</p>
-        <div className="form-grid">
-          <label className="field"><span>Email</span><input id="team-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
-          <label className="field"><span>Función</span>
-            <select id="team-role" value={role} onChange={(e) => setRole(e.target.value as StaffRole)}>
-              {roles.map((r) => <option key={r} value={r}>{roleLabel[r]}</option>)}
-            </select>
-          </label>
-        </div>
-        <button className="btn btn--primary" type="submit" disabled={busy || !email.trim()}>Añadir</button>
-      </form>
       <section className="card">
         <h3 className="card__title">Equipo</h3>
         {error && <Notice tone="danger">{error}</Notice>}
         {loading && !members.length ? <Spinner /> : (
           <ul className="team">
+            {!members.some((m) => m.role === 'owner') && !loading && data.kind !== 'mock' && (
+              <li className="muted small">Sin propietario todavía: el restaurante no se puede abrir hasta que acepte su invitación.</li>
+            )}
             {members.map((m) => {
               const manageable = !m.isMe && roles.includes(m.role);
               return (
@@ -310,6 +300,7 @@ function TeamPanel({ restaurant, session }: { restaurant: Restaurant; session: S
           </ul>
         )}
       </section>
+      <TeamInvitations restaurant={restaurant} session={session} onChanged={reload} />
     </div>
   );
 }
@@ -498,21 +489,41 @@ function QrCard({ label, url, href }: { label: string; url: string; href: string
   );
 }
 
-function CreateRestaurant({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (r: Restaurant) => void }) {
+/**
+ * Nuevo restaurante. Con Supabase, la plataforma lo crea junto con la invitación de su primer
+ * propietario (Edge Function «invitations»): nace cerrado y no se puede abrir hasta que el
+ * propietario acepte. En la demo (sin cuentas) se crea sin propietario.
+ */
+function CreateRestaurant({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (id: string) => void }) {
   const toast = useToast();
+  const withOwner = data.kind !== 'mock';
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
+  const [ownerEmail, setOwnerEmail] = useState('');
   const [touched, setTouched] = useState(false);
+  const [busy, setBusy] = useState(false);
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return toast('Escribe el nombre del restaurante.', 'danger');
+    if (withOwner && !ownerEmail.trim()) return toast('Escribe el email del propietario.', 'danger');
+    setBusy(true);
     try {
-      const r = await data.createRestaurant({ name: name.trim(), slug: slug || slugify(name) });
-      toast(`${r.name} creado. Añade su carta y actívalo cuando esté listo.`);
-      setName(''); setSlug(''); setTouched(false);
-      onCreated(r);
+      let id: string;
+      if (withOwner) {
+        const r = await data.createRestaurantWithOwner({ name: name.trim(), slug: slug || slugify(name), ownerEmail });
+        id = r.restaurantId ?? '';
+        toast(`${name.trim()} creado. ${r.message}`);
+      } else {
+        const r = await data.createRestaurant({ name: name.trim(), slug: slug || slugify(name) });
+        id = r.id;
+        toast(`${r.name} creado. Añade su carta y actívalo cuando esté listo.`);
+      }
+      setName(''); setSlug(''); setOwnerEmail(''); setTouched(false);
+      onCreated(id);
     } catch (err) {
       toast((err as Error).message, 'danger');
+    } finally {
+      setBusy(false);
     }
   };
   return (
@@ -526,8 +537,18 @@ function CreateRestaurant({ open, onClose, onCreated }: { open: boolean; onClose
           <input id="nr-slug" value={slug} onChange={(e) => { setTouched(true); setSlug(slugify(e.target.value)); }} />
           <small className="muted">{config.publicBaseUrl}/r/{slug || 'mi-restaurante'}</small>
         </label>
-        <p className="muted small">Se crea en pausa: no recibirá pedidos hasta que lo actives.</p>
-        <button className="btn btn--primary btn--block" type="submit">Crear restaurante</button>
+        {withOwner && (
+          <label className="field"><span>Email del propietario</span>
+            <input id="nr-owner" type="email" autoComplete="off" value={ownerEmail} onChange={(e) => setOwnerEmail(e.target.value)} />
+            <small className="muted">Recibirá una invitación: si ya tiene cuenta, la verá al entrar; si no, un correo para crearla.</small>
+          </label>
+        )}
+        <p className="muted small">
+          {withOwner
+            ? 'Se crea cerrado: no recibirá pedidos ni podrá abrirse hasta que el propietario acepte la invitación.'
+            : 'Se crea en pausa: no recibirá pedidos hasta que lo actives.'}
+        </p>
+        <button className="btn btn--primary btn--block" type="submit" disabled={busy}>{busy ? 'Creando…' : 'Crear restaurante'}</button>
       </form>
     </Modal>
   );

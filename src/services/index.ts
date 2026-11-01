@@ -15,6 +15,7 @@ const unavailable = new Proxy({} as DataService, {
     if (prop === 'requiresLogin') return true;
     if (prop === 'getAuthRedirect') return () => ({ kind: 'none' });
     if (prop === 'isPasswordRecoveryPending') return () => false;
+    if (prop === 'getPasswordSetupKind') return () => null;
     if (prop === 'dismissAuthRedirect') return () => {};
     return () => Promise.reject(new Error('La configuración de la app está incompleta.'));
   },

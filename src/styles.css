@@ -144,7 +144,8 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
   min-height: 44px; border: 1.5px solid var(--line); border-radius: var(--r-sm);
   background: var(--surface); padding: 8px 12px; width: 100%;
 }
-.rest-select select { width: auto; font-weight: 700; }
+.rest-select select { width: auto; font-weight: 700; max-width: 30ch; text-overflow: ellipsis; }
+@media (max-width: 640px) { .rest-select select { max-width: 34vw; } }
 .reset-ask { display: flex; gap: 4px; }
 .demo-strip {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 17px;
@@ -464,7 +465,7 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .access__card h1 { font-size: 1.7rem; font-weight: 800; margin-block: 4px 6px; }
 .session { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .session__who { font-size: .85rem; color: var(--muted); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 640px) { .session__who { display: none; } }
+@media (max-width: 640px) { .session__who, .session__invites { display: none; } }
 .notice--ok { background: var(--ok-soft); color: var(--ink); } .notice--ok .icon { color: var(--ok); }
 .page--notice { padding-block: 16px 0; }
 .link-btn { border: 0; background: none; padding: 0; color: var(--brand); text-decoration: underline; cursor: pointer; font: inherit; }
@@ -472,6 +473,7 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .team__row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line); }
 .team__row:first-child, .audit__row:first-child { border-top: 0; }
 .team__who { min-width: 0; overflow-wrap: anywhere; }
+.invite__detail { display: block; margin-top: 2px; }
 .team__role select { min-height: 36px; border: 1.5px solid var(--line); border-radius: var(--r-sm); background: var(--surface); padding: 4px 8px; }
 .audit__row { display: grid; gap: 2px; padding: 10px 0; border-top: 1px solid var(--line); }
 @media (max-width: 560px) { .team__row { grid-template-columns: 1fr; } }

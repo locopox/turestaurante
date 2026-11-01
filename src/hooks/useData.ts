@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { data, type Menu } from '../services';
-import type { AuditEntry, KitchenTicket, Order, Restaurant, StaffMember, StaffSession, SupportDenial, SupportGrant } from '../types';
+import type {
+  AuditEntry, Invitation, KitchenTicket, MyInvitation, Order, Restaurant, StaffMember, StaffSession, SupportDenial, SupportGrant,
+} from '../types';
 
 interface Loadable<T> {
   value: T | undefined;
@@ -84,6 +86,14 @@ export const useSupportDenials = (restaurantId: string | null, enabled: boolean)
 /** Solicitudes de soporte propias (plataforma). */
 export const useMySupportRequests = (enabled: boolean) =>
   useLoad<SupportGrant[]>(() => (enabled ? data.mySupportRequests() : Promise.resolve([])), null, [enabled]);
+
+/** Invitaciones de un restaurante (owner, manager o plataforma). */
+export const useInvitations = (restaurantId: string, enabled: boolean) =>
+  useLoad<Invitation[]>(() => (enabled ? data.listInvitations(restaurantId) : Promise.resolve([])), null, [restaurantId, enabled]);
+
+/** Invitaciones pendientes de quien ha iniciado sesión. Se vuelven a leer al cambiar la sesión. */
+export const useMyInvitations = (enabled: boolean) =>
+  useLoad<MyInvitation[]>(() => (enabled ? data.myInvitations() : Promise.resolve([])), (cb) => data.onAuthChange(cb), [enabled]);
 
 /** Reloj que se actualiza periódicamente (tiempos de espera en cocina). */
 export function useNow(intervalMs = 30000) {

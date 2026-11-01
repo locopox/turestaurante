@@ -1,6 +1,6 @@
 import type { AuthRedirect } from '../lib/authRedirect';
 import type {
-  AuditEntry, Category, KitchenTicket, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
+  AuditEntry, Category, Invitation, InvitationSent, KitchenTicket, MyInvitation, NewOrderInput, NewRestaurantInput, Order, PaymentStatus,
   PrepStatus, Product, Restaurant, StaffMember, StaffRole, StaffSession, SupportGrant, SupportOrderView,
   SupportDenial, SupportPaymentEventView, SupportRestaurantView,
 } from '../types';
@@ -32,8 +32,10 @@ export interface DataService {
   /** Enlace de Supabase Auth con el que se abrió la app (recuperación o enlace caducado). */
   getAuthRedirect(): AuthRedirect;
   dismissAuthRedirect(): void;
-  /** true tras abrir un enlace de recuperación válido, hasta fijar la contraseña nueva. */
+  /** true tras abrir un enlace de recuperación o de invitación válido, hasta fijar la contraseña. */
   isPasswordRecoveryPending(): boolean;
+  /** Por qué hay que fijar la contraseña: recuperación, invitación (cuenta nueva) o nada. */
+  getPasswordSetupKind(): 'recovery' | 'invite' | null;
   /** Fija la contraseña nueva del usuario que abrió el enlace de recuperación. */
   setNewPassword(newPassword: string): Promise<void>;
   /** Cambia la contraseña comprobando antes la actual. No cierra la sesión actual. */
@@ -46,7 +48,10 @@ export interface DataService {
   // Restaurantes (multi-tenant)
   listRestaurants(): Promise<Restaurant[]>;
   getRestaurantBySlug(slug: string): Promise<Restaurant | null>;
+  /** Solo demo (sin cuentas). Con Supabase se usa createRestaurantWithOwner. */
   createRestaurant(input: NewRestaurantInput): Promise<Restaurant>;
+  /** Plataforma: crea el restaurante (cerrado) y la invitación de su primer propietario. */
+  createRestaurantWithOwner(input: { name: string; slug: string; ownerEmail: string }): Promise<InvitationSent>;
   saveRestaurant(restaurant: Restaurant): Promise<Restaurant>;
 
   // Carta
@@ -73,12 +78,24 @@ export interface DataService {
   listKitchenOrders(restaurantId: string): Promise<KitchenTicket[]>;
   subscribeKitchen(restaurantId: string, onChange: () => void): Unsubscribe;
 
-  // Equipo (staff_* en la base de datos, con las reglas de cada rol)
+  // Equipo (staff_* en la base de datos, con las reglas de cada rol). Las altas son SOLO por
+  // invitación aceptada: no existe ninguna forma de añadir a alguien directamente.
   listStaff(restaurantId: string): Promise<StaffMember[]>;
-  /** Añade una cuenta que ya existe. Las invitaciones por correo llegarán en otra fase. */
-  addStaff(restaurantId: string, email: string, role: StaffRole): Promise<void>;
   changeStaffRole(restaurantId: string, userId: string, role: StaffRole): Promise<void>;
   removeStaff(restaurantId: string, userId: string): Promise<void>;
+
+  // Invitaciones (fase 6). Crear y reenviar pasan por la Edge Function «invitations» (que envía el
+  // correo en el servidor); el resto son funciones SQL con la sesión del usuario.
+  /** La respuesta es la misma tenga o no cuenta el correo. */
+  inviteStaff(restaurantId: string, email: string, role: StaffRole): Promise<InvitationSent>;
+  resendInvitation(invitationId: string): Promise<InvitationSent>;
+  revokeInvitation(invitationId: string): Promise<void>;
+  listInvitations(restaurantId: string): Promise<Invitation[]>;
+  /** Invitaciones que puede aceptar quien ha iniciado sesión (las de su correo confirmado). */
+  myInvitations(): Promise<MyInvitation[]>;
+  /** Devuelve el restaurante al que se ha unido. La función la decide la invitación, no la app. */
+  acceptInvitation(invitationId: string): Promise<string>;
+  declineInvitation(invitationId: string): Promise<void>;
 
   // Plataforma y auditoría
   setRestaurantSuspension(restaurantId: string, suspended: boolean, reason: string): Promise<void>;

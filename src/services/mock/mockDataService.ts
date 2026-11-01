@@ -22,6 +22,7 @@ const demoSession = (restaurants: { id: string }[]): StaffSession => ({
   memberships: restaurants.map((r) => ({ restaurantId: r.id, role: 'owner' })),
 });
 const NO_ACCOUNTS = 'En el modo demo no hay cuentas de personal: el equipo se gestiona con Supabase.';
+const NO_INVITES = 'Las invitaciones necesitan Supabase: en la demo no hay cuentas ni se envían correos.';
 const NO_SUPPORT = 'El modo soporte necesita Supabase: en la demo no hay cuentas de plataforma ni de propietario separadas.';
 /** Restaurantes guardados por versiones anteriores de la demo no tienen «suspended». */
 const normalize = (r: Restaurant): Restaurant => ({ ...r, suspended: r.suspended ?? false });
@@ -100,6 +101,9 @@ export class MockDataService implements DataService {
     return { kind: 'none' } as const;
   }
   dismissAuthRedirect() {}
+  getPasswordSetupKind() {
+    return null;
+  }
   isPasswordRecoveryPending() {
     return false;
   }
@@ -302,8 +306,30 @@ export class MockDataService implements DataService {
   async listStaff() {
     return [];
   }
-  async addStaff(): Promise<void> {
-    throw new Error(NO_ACCOUNTS);
+  // Invitaciones: en la demo no hay cuentas ni correo. Nada se concede desde aquí.
+  async inviteStaff(): Promise<never> {
+    throw new Error(NO_INVITES);
+  }
+  async resendInvitation(): Promise<never> {
+    throw new Error(NO_INVITES);
+  }
+  async revokeInvitation(): Promise<void> {
+    throw new Error(NO_INVITES);
+  }
+  async listInvitations() {
+    return [];
+  }
+  async myInvitations() {
+    return [];
+  }
+  async acceptInvitation(): Promise<string> {
+    throw new Error(NO_INVITES);
+  }
+  async declineInvitation(): Promise<void> {
+    throw new Error(NO_INVITES);
+  }
+  async createRestaurantWithOwner(): Promise<never> {
+    throw new Error(NO_INVITES);
   }
   async changeStaffRole(): Promise<void> {
     throw new Error(NO_ACCOUNTS);
