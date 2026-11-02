@@ -145,6 +145,11 @@ desplegar.
   («La Piazza · Sala»); los permisos son los de ese restaurante.
 - En el **modo demo** no hay cuentas ni correos: las pantallas lo explican y el resto funciona igual.
 
+**Pruebas con Supabase local (E4):** base de datos, Auth, correo (Mailpit), las dos Edge Functions en el Edge Runtime
+de Supabase, `pg_cron`, `pg_net`, Vault y la app en el navegador, con guía y scripts en
+[`supabase/tests/local/README.md`](supabase/tests/local/README.md). **Realtime no se ha probado en la E4** (el entorno
+de prueba no tiene IPv6 y se desactivó solo en esa copia local); queda pendiente.
+
 - **Nadie tiene permisos antes de aceptar.** La invitación vive en `private.invitations` (no accesible por la API)
   y ninguna comprobación de permisos la lee. El único alta en un equipo es `invitation_accept(id)`, que exige:
   sesión, el **correo confirmado** de la cuenta igual al de la invitación, pendiente y sin caducar, restaurante no
@@ -194,6 +199,10 @@ npm test          # reglas de pedido, modo demo, permisos y variables de entorno
 npm run test:db         # seguridad del SQL y entregas simultáneas: necesita un PostgreSQL LOCAL (no Supabase)
 npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada (PostgreSQL LOCAL)
 npm run test:recovery   # recuperación programada: necesita pg_cron en el PostgreSQL LOCAL (si no, se omite)
+npm run test:e2e:demo   # navegador (Playwright): el modo demo sigue funcionando
+# Con Supabase LOCAL (CLI + Docker), ver supabase/tests/local/README.md:
+npm run test:local:integration  # invitaciones de extremo a extremo por API (Auth, correo, permisos, límites)
+npm run test:e2e:local  # recorridos de invitaciones en el navegador contra Supabase local
 ```
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten

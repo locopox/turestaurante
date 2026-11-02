@@ -12,7 +12,10 @@
     "test": "vitest run",
     "test:db": "supabase/tests/run.sh",
     "test:migration": "supabase/tests/migration_test.sh",
-    "test:recovery": "supabase/tests/recovery_test.sh"
+    "test:recovery": "supabase/tests/recovery_test.sh",
+    "test:local:integration": "node supabase/tests/local/integration_test.mjs",
+    "test:e2e:local": "playwright test --project=supabase-local",
+    "test:e2e:demo": "playwright test --project=demo"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",

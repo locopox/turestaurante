@@ -114,7 +114,8 @@ por git).
 
 ## Configuración de Supabase Auth necesaria
 
-1. **Registro público desactivado** (Authentication → Sign In / Providers → «Allow new users to sign up»: off).
+1. **Registro público desactivado** (Authentication → Sign In / Providers → «Allow new users to sign up»: off). El
+   proveedor «Email» debe seguir **activado**: si se desactiva, nadie puede iniciar sesión con su contraseña.
 2. **Site URL** y **Redirect URLs**: incluir exactamente `APP_URL`.
 3. Plantilla **«Invite user»** en español (Authentication → Emails). El enlace usa `{{ .ConfirmationURL }}`.
 4. **SMTP propio** antes de invitar a personas reales: el SMTP de Supabase solo entrega a los correos del equipo del
@@ -123,82 +124,17 @@ por git).
 6. Caducidad del enlace del correo (Email OTP expiration): es independiente de los 7 días de la invitación. Si el
    enlace caduca, se reenvía la invitación.
 
-## Probar con Supabase local (Docker) — guion para la E4
+## Probar con Supabase local (Docker)
 
-> No se ha podido ejecutar en este entorno: Docker funciona, pero la red no permite descargar las imágenes de
-> Supabase. Comprueba los nombres de las opciones de `config.toml` con tu versión de la CLI.
+Guía probada en la E4, con la configuración exacta y los scripts: [`supabase/tests/local/README.md`](../../tests/local/README.md).
 
-1. Requisitos: Docker y la [CLI de Supabase](https://supabase.com/docs/guides/local-development).
-2. Usa una carpeta de trabajo **aparte** (las migraciones de `supabase/migrations` empiezan en la fase 3 y no sirven
-   para una base vacía):
+Dos detalles de configuración que conviene no equivocar (comprobados en la E4):
 
-   ```bash
-   mkdir -p ~/tr-local && cd ~/tr-local && supabase init
-   mkdir -p supabase/functions && cp -r /ruta/a/turestaurante/supabase/functions/invitations supabase/functions/
-   ```
-
-3. En `~/tr-local/supabase/config.toml`:
-
-   ```toml
-   [auth]
-   site_url = "http://localhost:5173"
-   additional_redirect_urls = ["http://localhost:5173/"]
-   enable_signup = false
-
-   [auth.email]
-   enable_signup = false
-
-   [functions.invitations]
-   verify_jwt = true
-   ```
-
-4. Arranca y carga el esquema y La Piazza (base de datos LOCAL de Docker, nunca la del proyecto real):
-
-   ```bash
-   supabase start          # muestra API URL, claves locales y la URL del buzón de pruebas (Mailpit/Inbucket)
-   psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f /ruta/a/turestaurante/supabase/schema.sql
-   psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f /ruta/a/turestaurante/supabase/seed.sql
-   ```
-
-5. Sirve la función con `APP_URL` local (copia `.env.example` a `.env.local`):
-
-   ```bash
-   supabase functions serve invitations --env-file /ruta/a/turestaurante/supabase/functions/.env.local
-   ```
-
-6. Cuenta de plataforma: en el Studio local (Authentication → Add user, «Auto confirm») y después
-   `insert into public.platform_admins (user_id) select id from auth.users where email = 'admin@local.test';`.
-7. JWT de esa cuenta (clave pública LOCAL que muestra `supabase start`):
-
-   ```bash
-   curl -s "http://127.0.0.1:54321/auth/v1/token?grant_type=password" -H "apikey: <clave pública local>" \
-     -H "content-type: application/json" -d '{"email":"admin@local.test","password":"<contraseña>"}'
-   ```
-
-8. Llamadas (con el `access_token` anterior):
-
-   ```bash
-   curl -s http://127.0.0.1:54321/functions/v1/invitations -H "authorization: Bearer <access_token>" \
-     -H "content-type: application/json" \
-     -d '{"action":"create_restaurant","name":"Tercer Sitio","slug":"tercer-sitio","ownerEmail":"duena@local.test"}'
-   ```
-
-Casos a comprobar en la E4 (dos restaurantes, cuentas distintas):
-
-- **Cuenta nueva**: llega el correo al buzón local; el enlace vuelve a `APP_URL` con `type=invite`; tras elegir
-  contraseña, `my_invitations` la muestra y `invitation_accept` funciona.
-- **Cuenta invitada sin confirmar**: reenviar (pasados 5 min, o con una segunda invitación de otro restaurante)
-  manda un enlace nuevo; el anterior deja de valer; no se crea otra cuenta.
-- **Cuenta existente confirmada** (de otro restaurante y de la plataforma): no llega correo; la respuesta es idéntica.
-- **Fallo de envío**: con el límite de correos a 0 (`[auth.rate_limit] email_sent = 0`) Supabase responde 429; la
-  entrega queda `sin_enviar` con espera y, tras 3 intentos, `fallida`; la respuesta no cambia y la plataforma ve
-  `invitacion.entrega`.
-- **Interrupción**: detener `supabase functions serve` mientras envía; al volver, otra invitación (pasados 2 o 10
-  minutos) recupera la entrega.
-- **Segundo plano**: la respuesta llega antes que el correo.
-- **Límites** de 20/hora, 30 pendientes, 5 minutos y 3 reenvíos: 429.
-- **Permisos**: owner → owner (403), manager → manager (403), otro restaurante (403), sin sesión (401).
-- **Redirección**: un `redirectTo` en la petición no cambia el enlace del correo.
+- El registro público se cierra con `[auth] enable_signup = false` (en el panel: «Allow new users to sign up»).
+  **No** pongas `[auth.email] enable_signup = false`: eso desactiva el proveedor de correo y nadie puede iniciar
+  sesión («Email logins are disabled»).
+- En Supabase local la CLI no aplica `[auth.rate_limit] email_sent`: para provocar un fallo de entrega real, para el
+  servidor de correo local (`docker stop supabase_inbucket_<proyecto>`).
 
 ## Comprobar el código sin Supabase
 
