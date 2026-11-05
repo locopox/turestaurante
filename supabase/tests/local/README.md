@@ -100,6 +100,21 @@ RECOVERY_SECRET=… RECOVERY_URL=… node supabase/tests/local/recovery_integrat
 En Supabase local la CLI **no aplica** `[auth.rate_limit] email_sent` (fija un límite muy alto), por eso el fallo de
 entrega se provoca parando el servidor de correo.
 
+## Prueba de aislamiento de cocina (`npm run test:local:isolation`)
+
+Comprueba con una **sesión real** de Supabase Auth que un usuario de cocina asignado solo a un restaurante puede
+consultar la cocina de ese restaurante (`kitchen_orders` → 200) y recibe un rechazo en otro (403, código `42501`).
+
+- Solo contra Supabase local y solo con la clave **pública**: no usa `service_role` ni acceso directo a la base de
+  datos, y no modifica nada.
+- La contraseña se pide en la terminal **sin mostrarse** y no se guarda en ningún archivo.
+- Configuración: copia `isolation.env.example` a `supabase/tests/local/.env.local` (ignorado por git) y rellena la
+  clave pública y el correo del usuario de cocina.
+
+```bash
+npm run test:local:isolation
+```
+
 ## Limitaciones conocidas de este entorno de prueba (E4)
 
 - **Realtime no se ha probado**: en el entorno de la E4 (sin IPv6) el contenedor de Realtime no arranca

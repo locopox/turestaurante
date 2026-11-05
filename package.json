@@ -15,7 +15,8 @@
     "test:recovery": "supabase/tests/recovery_test.sh",
     "test:local:integration": "node supabase/tests/local/integration_test.mjs",
     "test:e2e:local": "playwright test --project=supabase-local",
-    "test:e2e:demo": "playwright test --project=demo"
+    "test:e2e:demo": "playwright test --project=demo",
+    "test:local:isolation": "node supabase/tests/local/kitchen_isolation_test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",
