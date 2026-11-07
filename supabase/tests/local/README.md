@@ -158,10 +158,32 @@ eval "$(cd ~/tr-local && supabase status -o env)"   # variables de Supabase LOCA
 npm run test:local:orders
 ```
 
+**Windows (PowerShell).** Carga las variables en la ventana donde vas a ejecutar la prueba (no muestra sus
+valores) y usa `npm.cmd`:
+
+```powershell
+cd C:\ruta\a\tr-local
+supabase status -o env | ForEach-Object { if ($_ -match '^([A-Z_]+)="(.*)"$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] } }
+cd C:\ruta\a\turestaurante
+npm.cmd run test:local:orders
+```
+
+**psql.** La prueba usa `psql` para preparar y limpiar. Si el equipo no lo tiene (lo normal en Windows), usa el `psql`
+del contenedor de la base de datos de Supabase local, y antes de la primera consulta comprueba que:
+
+- Docker es el de este equipo (ni `DOCKER_HOST` ni el contexto de Docker apuntan a otro servidor);
+- hay un único contenedor en marcha que publica el puerto de `DB_URL`;
+- se llama `supabase_db_<proyecto>`, tiene la etiqueta `com.supabase.cli.project` de ese proyecto y su imagen es
+  `supabase/postgres`.
+
+La contraseña de la base de datos se pasa por variable de entorno (`docker exec -e PGPASSWORD`), nunca en la orden.
+Para elegir a mano: `ORDERS_TEST_PSQL=local` (solo el `psql` del equipo) o `ORDERS_TEST_PSQL=docker` (solo el del
+contenedor).
+
 Restos de una ejecución interrumpida (muestra lo que borraría y pide escribir `BORRAR`):
 
 ```bash
-npm run test:local:orders -- --limpiar
+npm run test:local:orders -- --limpiar          # en Windows: npm.cmd run test:local:orders -- --limpiar
 ```
 
 ## Limitaciones conocidas de este entorno de prueba (E4)

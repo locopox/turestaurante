@@ -23,6 +23,9 @@
 //   eval "$(cd ~/tr-local && supabase status -o env)"
 //   npm run test:local:orders                 # prueba completa
 //   npm run test:local:orders -- --limpiar    # restos de una ejecución interrumpida (pide confirmación)
+//
+// psql: si este equipo no lo tiene (lo normal en Windows), se usa el psql del contenedor de la base de datos de
+// Supabase LOCAL, después de comprobar que el contenedor es ese (ORDERS_TEST_PSQL=auto|local|docker).
 import { execFileSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
@@ -32,6 +35,7 @@ const RUN = `${Date.now().toString(36)}${randomBytes(3).toString('hex')}`;
 const MAIL_DOMAIN = 'pedidos-prueba.test';
 
 let cleanupNeeded = false; // hay datos de prueba creados que limpiar
+let dbRunner = null; // cómo se ejecuta psql (se elige tras comprobar que todo es local)
 
 function stop(message, code = 2) {
   console.error(`\nDETENIDO: ${message}`);
@@ -51,7 +55,9 @@ let ADMIN_KEY = env('SECRET_KEY', 'SERVICE_ROLE_KEY');
 const DB_URL = env('DB_URL');
 
 const LOCAL_HOSTS = ['127.0.0.1', 'localhost'];
-const help = 'Carga las variables de Supabase LOCAL: eval "$(cd ~/tr-local && supabase status -o env)"';
+const help = process.platform === 'win32'
+  ? 'Carga las variables de Supabase LOCAL en esta ventana de PowerShell (instrucciones en supabase/tests/local/README.md).'
+  : 'Carga las variables de Supabase LOCAL: eval "$(cd ~/tr-local && supabase status -o env)"';
 
 function checkLocalApi() {
   let u;
@@ -65,8 +71,8 @@ function checkLocalApi() {
     stop('API_URL no es un Supabase LOCAL (debe ser http://127.0.0.1:54321 o similar). Esta prueba nunca se conecta a un proyecto remoto.');
   }
 }
-/** Conexión a la base de datos LOCAL, por variables de libpq (la contraseña no aparece en la línea de órdenes). */
-function localDbEnv() {
+/** Datos de conexión de DB_URL, comprobando que es la base de datos LOCAL. */
+function localDb() {
   let u;
   try {
     u = new URL(DB_URL);
@@ -77,15 +83,10 @@ function localDbEnv() {
   if (!['postgres:', 'postgresql:'].includes(u.protocol) || !LOCAL_HOSTS.includes(u.hostname) || u.search) {
     stop('DB_URL no es la base de datos de Supabase LOCAL (debe ser postgresql://…@127.0.0.1:54322/postgres). Esta prueba nunca se conecta a una base de datos remota.');
   }
-  const out = { ...process.env };
-  // Nada de lo que hay en el entorno puede redirigir psql a otro servidor.
-  for (const k of Object.keys(out)) if (/^PG/.test(k)) delete out[k];
-  Object.assign(out, {
-    PGHOST: u.hostname, PGPORT: u.port || '5432', PGUSER: decodeURIComponent(u.username),
-    PGPASSWORD: decodeURIComponent(u.password), PGDATABASE: decodeURIComponent(u.pathname.slice(1)) || 'postgres',
-    PGCONNECT_TIMEOUT: '5', PGAPPNAME: 'orders_security_test',
-  });
-  return out;
+  return {
+    host: u.hostname, port: u.port || '5432', user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password), database: decodeURIComponent(u.pathname.slice(1)) || 'postgres',
+  };
 }
 
 function jwtRole(key) {
@@ -99,7 +100,7 @@ const isSecretKey = (k) => k.startsWith('sb_secret_') || jwtRole(k) === 'service
 
 // Todas las conexiones se comprueban ANTES de cualquier operación de administración.
 checkLocalApi();
-const DB_ENV = localDbEnv();
+const DB = localDb();
 if (!PUBLIC_KEY) stop(`falta la clave pública (PUBLISHABLE_KEY o ANON_KEY). ${help}`);
 if (isSecretKey(PUBLIC_KEY)) stop('la clave pública contiene una clave SECRETA (service_role). Revisa PUBLISHABLE_KEY / ANON_KEY.');
 if (!PUBLIC_KEY.startsWith('sb_publishable_') && jwtRole(PUBLIC_KEY) !== 'anon') {
@@ -110,20 +111,138 @@ if (!CLEAN_MODE) {
   if (!isSecretKey(ADMIN_KEY)) stop('SECRET_KEY / SERVICE_ROLE_KEY no parece una clave de administración de Supabase.');
 }
 
+// ---------- ¿Qué psql se usa? (el de este equipo o el del contenedor de Supabase LOCAL) ----------
+/** Entorno para psql y docker: sin las variables PG* del usuario (podrían llevar psql a otro servidor). */
+function childEnv(extra = {}) {
+  const out = { ...process.env };
+  for (const k of Object.keys(out)) if (/^PG/i.test(k)) delete out[k];
+  return Object.assign(out, extra);
+}
+/** Variables de conexión de psql. La contraseña va en PGPASSWORD, nunca en la línea de órdenes. */
+const pgVars = (host, port) => ({
+  PGHOST: host, PGPORT: String(port), PGUSER: DB.user, PGPASSWORD: DB.password, PGDATABASE: DB.database,
+  PGCONNECT_TIMEOUT: '5', PGAPPNAME: 'orders_security_test', PGCLIENTENCODING: 'UTF8',
+});
+/** Ejecuta un programa directamente (sin intérprete de órdenes). Nunca muestra su entorno. */
+function runProgram(cmd, args, { input, env } = {}) {
+  try {
+    const out = execFileSync(cmd, args, {
+      input, env: env ?? childEnv(), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    return { ok: true, out: out.trim() };
+  } catch (e) {
+    return { ok: false, missing: e.code === 'ENOENT', err: String(e.stderr ?? '') };
+  }
+}
+const firstLine = (text) => String(text).split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
+
+/**
+ * Contenedor de la base de datos de Supabase LOCAL que publica el puerto de DB_URL. Se comprueba TODO antes de
+ * ejecutar la primera consulta: Docker de este equipo, un único contenedor en marcha con ese puerto, nombre
+ * supabase_db_<proyecto>, etiqueta de la CLI de Supabase con el mismo proyecto e imagen supabase/postgres.
+ */
+function findSupabaseDbContainer() {
+  const dockerHost = (process.env.DOCKER_HOST ?? '').trim();
+  if (dockerHost && !/^(unix|npipe):\/\//i.test(dockerHost)) {
+    stop('DOCKER_HOST apunta a un Docker que no es el de este equipo. Esta prueba solo usa el Docker local (quita DOCKER_HOST de esta ventana).');
+  }
+  const ctx = runProgram('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}']);
+  if (ctx.missing) {
+    stop('no se encuentra el programa «psql» en este equipo, ni el programa «docker» para usar el psql del contenedor de Supabase local. ¿Está instalado y en marcha Docker Desktop?');
+  }
+  if (!ctx.ok) stop(`no se pudo consultar Docker (${firstLine(ctx.err) || 'sin detalle'}). ¿Está Docker Desktop en marcha?`);
+  if (!dockerHost && !/^(unix|npipe):\/\//i.test(ctx.out)) {
+    stop('el contexto actual de Docker no es el Docker de este equipo. Esta prueba solo usa el Docker local (docker context use default).');
+  }
+
+  const ps = runProgram('docker', ['ps', '--filter', `publish=${DB.port}`, '--format', '{{.ID}}']);
+  if (!ps.ok) stop(`no se pudo consultar Docker (${firstLine(ps.err) || 'sin detalle'}).`);
+  const ids = ps.out.split(/\s+/).filter(Boolean);
+  if (ids.length === 0) stop(`ningún contenedor de Docker en marcha publica el puerto ${DB.port} de DB_URL. ¿Está Supabase local en marcha (supabase start)?`);
+  if (ids.length > 1) stop(`hay ${ids.length} contenedores que publican el puerto ${DB.port}: no se puede saber cuál es la base de datos de Supabase local.`);
+  const id = ids[0];
+  // Solo los campos necesarios (no se lee el entorno del contenedor, que contiene secretos).
+  const field = (fmt) => {
+    const r = runProgram('docker', ['inspect', '--type', 'container', '--format', `{{json ${fmt}}}`, id]);
+    if (!r.ok) stop(`no se pudo inspeccionar el contenedor (${firstLine(r.err) || 'sin detalle'}).`);
+    try {
+      return JSON.parse(r.out);
+    } catch {
+      stop('Docker ha devuelto una respuesta inesperada al inspeccionar el contenedor.');
+    }
+  };
+  const name = String(field('.Name') ?? '').replace(/^\//, '');
+  const image = String(field('.Config.Image') ?? '');
+  const labels = field('.Config.Labels') ?? {};
+  const ports = field('.NetworkSettings.Ports') ?? {};
+  const running = field('.State.Running') === true;
+
+  const project = /^supabase_db_([A-Za-z0-9_.-]+)$/.exec(name)?.[1];
+  const imageRepo = image.replace(/@.*$/, '').replace(/:[^/:]+$/, '');
+  const notSupabase = (why) => stop(`el contenedor que publica el puerto ${DB.port} («${name || id}») no parece la base de datos de Supabase local: ${why}. No se ejecuta ninguna consulta.`);
+  if (!running) notSupabase('no está en marcha');
+  if (!project) notSupabase('su nombre no es supabase_db_<proyecto>');
+  if (labels['com.supabase.cli.project'] !== project) notSupabase('no tiene la etiqueta de la CLI de Supabase de ese proyecto');
+  if (!/(^|\/)supabase\/postgres$/.test(imageRepo)) notSupabase('su imagen no es supabase/postgres');
+  let innerPort = null;
+  for (const [key, bindings] of Object.entries(ports)) {
+    const m = /^(\d+)\/tcp$/.exec(key);
+    if (m && (bindings ?? []).some((b) => String(b.HostPort) === DB.port && ['', '0.0.0.0', '127.0.0.1', '::', '::1'].includes(b.HostIp ?? ''))) innerPort = m[1];
+  }
+  if (!innerPort) notSupabase(`no publica su PostgreSQL en el puerto ${DB.port} de este equipo`);
+  const v = runProgram('docker', ['exec', id, 'psql', '--version']);
+  if (!v.ok) stop(`el contenedor ${name} no tiene psql disponible (${firstLine(v.err) || 'sin detalle'}).`);
+  return { id, name, innerPort };
+}
+
+const PSQL_MODE = (process.env.ORDERS_TEST_PSQL ?? 'auto').trim().toLowerCase(); // auto | local | docker
+/** Elige cómo ejecutar psql. Se decide (y se comprueba) antes de la primera operación de administración. */
+function chooseDbRunner() {
+  if (!['auto', 'local', 'docker'].includes(PSQL_MODE)) stop('ORDERS_TEST_PSQL solo admite «auto», «local» o «docker».');
+  if (PSQL_MODE !== 'docker') {
+    const v = runProgram('psql', ['--version']);
+    if (v.ok) {
+      return {
+        label: 'psql de este equipo',
+        exec: (args, input) => runProgram('psql', args, { input, env: childEnv(pgVars(DB.host, DB.port)) }),
+      };
+    }
+    if (PSQL_MODE === 'local') stop('no se encuentra el programa «psql» en este equipo (ORDERS_TEST_PSQL=local).');
+  }
+  const c = findSupabaseDbContainer();
+  // Dentro del contenedor, PostgreSQL escucha en su propio puerto. «-e NOMBRE» (sin valor) pasa la variable
+  // desde el entorno de docker: la contraseña no aparece en la línea de órdenes.
+  const vars = pgVars('127.0.0.1', c.innerPort);
+  const passEnv = Object.keys(vars).flatMap((k) => ['-e', k]);
+  return {
+    label: `psql del contenedor ${c.name}`,
+    exec: (args, input) => runProgram('docker', ['exec', '-i', ...passEnv, c.id, 'psql', ...args], { input, env: childEnv(vars) }),
+  };
+}
+
 // ---------- Administración LOCAL (solo preparar, limpiar y la «foto» de solo lectura) ----------
 /** Ejecuta SQL en la base de datos LOCAL. Los valores van como variables de psql (:'nombre'), nunca pegados al texto. */
 function adminSql(script, vars = {}) {
+  if (!dbRunner) throw new Error('no se ha comprobado la conexión con la base de datos local');
   const args = ['-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1'];
   for (const [k, v] of Object.entries(vars)) args.push('-v', `${k}=${v}`);
-  try {
-    return execFileSync('psql', args, { input: script, env: DB_ENV, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-  } catch (e) {
-    const msg = String(e.stderr ?? '').split('\n').find((l) => /ERROR|FATAL|could not|no se pudo/i.test(l)) ?? 'error desconocido';
-    const err = new Error(msg.replace(/^.*?(ERROR|FATAL):\s*/, '').trim());
-    err.sql = true;
-    throw err;
+  const r = dbRunner.exec(args, script);
+  if (r.ok) return r.out;
+  let msg;
+  if (r.missing) msg = `no se encuentra el programa necesario para usar la base de datos (${dbRunner.label})`;
+  else {
+    const lines = r.err.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    msg = (lines.find((l) => /ERROR|FATAL|error|could not|no se pudo/i.test(l)) ?? lines[0] ?? 'psql terminó con un error sin mensaje')
+      .replace(/^.*?(ERROR|FATAL|error):\s*/, '').trim();
   }
+  const err = new Error(`${msg} [${dbRunner.label}]`);
+  err.sql = true;
+  throw err;
 }
+// Con las URL y las claves ya comprobadas, se elige el psql (y, si es el del contenedor, se verifica el
+// contenedor) ANTES de la primera operación de administración.
+dbRunner = chooseDbRunner();
+
 const pgArray = (ids) => `{${ids.join(',')}}`;
 
 /** Crea una cuenta confirmada con la API de administración de Auth LOCAL (solo en la fase de preparación). */
@@ -293,7 +412,7 @@ function ask(question) {
 // MODO --limpiar: restos de ejecuciones interrumpidas
 // =====================================================================================================
 if (CLEAN_MODE) {
-  console.log(`Limpieza de restos de la prueba de pedidos en la base de datos LOCAL (${DB_ENV.PGHOST}:${DB_ENV.PGPORT})\n`);
+  console.log(`Limpieza de restos de la prueba de pedidos en la base de datos LOCAL (${DB.host}:${DB.port}, ${dbRunner.label})\n`);
   let found;
   try {
     found = JSON.parse(adminSql(`
@@ -371,7 +490,7 @@ process.on('SIGINT', () => {
 });
 
 console.log('Pruebas de seguridad de pedidos (P1–P10) contra Supabase LOCAL');
-console.log(`API: ${API_URL} · base de datos: ${DB_ENV.PGHOST}:${DB_ENV.PGPORT} · ejecución ${RUN}`);
+console.log(`API: ${API_URL} · base de datos: ${DB.host}:${DB.port} (${dbRunner.label}) · ejecución ${RUN}`);
 
 let snapshotBefore;
 let startedAt;
