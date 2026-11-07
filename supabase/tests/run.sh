@@ -26,3 +26,8 @@ psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists ${DB}_paralel
 psql -v ON_ERROR_STOP=1 -q -d ${DB}_paralelo -f tests/supabase_shim.sql -f schema.sql -f seed.sql
 bash tests/delivery_concurrency_test.sh ${DB}_paralelo
 psql -q -d postgres -c "drop database ${DB}_paralelo"
+# Límites de pedidos con peticiones simultáneas, en otra base desechable
+psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists ${DB}_limites" -c "create database ${DB}_limites"
+psql -v ON_ERROR_STOP=1 -q -d ${DB}_limites -f tests/supabase_shim.sql -f schema.sql -f seed.sql
+bash tests/order_limits_concurrency_test.sh ${DB}_limites
+psql -q -d postgres -c "drop database ${DB}_limites"

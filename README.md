@@ -207,7 +207,8 @@ npm run test:e2e:local  # recorridos de invitaciones en el navegador contra Supa
 
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
 `PGHOST`/`PGPORT`/`PGUSER`, carga `supabase/tests/supabase_shim.sql` (imita los roles de Supabase),
-`schema.sql` y `seed.sql`, dos veces cada uno, y ejecuta `supabase/tests/security_test.sql`.
+`schema.sql` y `seed.sql`, dos veces cada uno, y ejecuta `supabase/tests/security_test.sql`. Después prueba con
+sesiones en paralelo las entregas de invitaciones y los límites de pedidos (`order_limits_concurrency_test.sh`).
 
 ## Migraciones
 
@@ -224,13 +225,21 @@ npm run test:e2e:local  # recorridos de invitaciones en el navegador contra Supa
   `restaurant_staff` y `platform_admins`.
 - `supabase/migrations/20261105120000_fase6_recuperacion_programada.sql` (después de la anterior, **solo en
   Supabase**: necesita pg_cron, pg_net y Vault) crea la tarea programada de recuperación. No contiene secretos.
-- `supabase/migrations_down/` las deshace (primero la de la recuperación programada; después la de la fase 6, que **borra el historial de invitaciones**,
+- `supabase/migrations/20261108120000_limites_pedidos.sql` (después de las de la fase 6) añade los **límites de
+  pedidos sin pagar** contra pedidos anónimos masivos: por defecto 8 por mesa, 15 para recoger, 40 en el restaurante
+  y 30 online pendientes, contando solo los creados en los últimos 30 minutos que siguen sin pagar y sin entregar ni
+  cancelar. Solo la plataforma cambia los límites (`platform_set_order_limits`); owner y manager ven los intentos
+  frenados de su restaurante (`order_limit_hits_list`). No borra ni modifica datos, y no cancela ningún pedido.
+  **Cambia la respuesta** de `create_order` y `customer_switch_to_counter` cuando se supera un límite:
+  `{rejected, code: 'TR429', reason, message}` sin `id`, con el estado HTTP 429 (la app la recibe como error).
+- `supabase/migrations_down/` las deshace (primero la de los límites de pedidos, que **borra los límites fijados y el
+  registro de intentos frenados**; después la de la recuperación programada; después la de la fase 6, que **borra el historial de invitaciones**,
   también las pendientes, y conserva a quien ya aceptó; después la de la fase 5, que **borra el registro de consultas
   denegadas**). La de la fase 4 **borra el historial de
   accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y
   las suspensiones**.
-- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 → fase 6 es idéntica a una
-  instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
+- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 → fase 6 → límites de pedidos es idéntica a
+  una instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
 
 Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
 hace falta una cuenta de personal distinta (por ejemplo, un propietario). Desde la fase 6 se invita

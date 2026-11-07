@@ -1748,6 +1748,311 @@ select tests.claims(null, null);
 select tests.ok(tests.affected($$insert into public.restaurants (slug, name, active) values ('desde-sql-editor', 'Desde SQL Editor', true)$$) = 1,
   'SQL Editor: puede crear restaurantes abiertos (datos iniciales)');
 
+-- ===================== 16. LÍMITES DE PEDIDOS SIN PAGAR (CAPA A CONTRA PEDIDOS MASIVOS) =====================
+reset role;
+select tests.claims(null, null);
+-- Dos restaurantes propios de esta sección (L1 con límites bajos, L2 con los de por defecto).
+create function tests.l1() returns uuid language sql immutable as $$ select 'f0000000-0000-4000-8000-000000000001'::uuid $$;
+create function tests.l2() returns uuid language sql immutable as $$ select 'f0000000-0000-4000-8000-000000000002'::uuid $$;
+create function tests.l1_prod() returns uuid language sql immutable as $$ select 'f0000000-0000-4000-8000-000000000201'::uuid $$;
+create function tests.l2_prod() returns uuid language sql immutable as $$ select 'f0000000-0000-4000-8000-000000000202'::uuid $$;
+-- Pedido en L1: mesa 1, pago en caja, 1 unidad (5 €). extra cambia lo que haga falta.
+create function tests.lp(token int, extra jsonb default '{}'::jsonb) returns jsonb language sql stable as $$
+  select jsonb_build_object('restaurantId', tests.l1(), 'mode', 'mesa', 'table', 1, 'paymentMethod', 'caja',
+    'accessToken', tests.tok(token), 'items', jsonb_build_array(jsonb_build_object('productId', tests.l1_prod(), 'quantity', 1))) || extra
+$$;
+create function tests.lp2(token int, extra jsonb default '{}'::jsonb) returns jsonb language sql stable as $$
+  select tests.lp(token, jsonb_build_object('restaurantId', tests.l2(),
+    'items', jsonb_build_array(jsonb_build_object('productId', tests.l2_prod(), 'quantity', 1))) || extra)
+$$;
+-- ¿Es la respuesta un pedido creado? ¿Es un rechazo por límite (y de qué tipo)?
+create function tests.created(k text) returns boolean language sql stable as $$
+  select tests.v(k) ? 'id' and not (tests.v(k) ? 'rejected')
+$$;
+create function tests.rejected(k text, reason text) returns boolean language sql stable as $$
+  select tests.v(k) ->> 'rejected' = 'true' and tests.v(k) ->> 'reason' = reason and tests.v(k) ->> 'code' = 'TR429'
+    and not (tests.v(k) ?| array['id', 'number', 'total', 'items', 'paymentStatus']) and length(tests.v(k) ->> 'message') > 20
+$$;
+-- Huella de todos los pedidos que NO son de esta sección (deben quedar intactos).
+create function tests.other_orders() returns text language sql stable as $$
+  select md5(coalesce(string_agg(o.id || o.payment_method::text || o.payment_status::text || o.prep_status::text
+    || o.total_cents || o.created_at || o.updated_at, '|' order by o.id), ''))
+  from public.orders o where o.restaurant_id not in (tests.l1(), tests.l2())
+$$;
+create function tests.l1_count(cond text default 'true') returns int language plpgsql as $$
+declare n int; begin execute format('select count(*) from public.orders where restaurant_id = %L and %s', tests.l1(), cond) into n; return n; end $$;
+create function tests.hits(kind text, tbl int default 0) returns int language sql stable as $$
+  select coalesce(sum(attempts), 0)::int from private.order_limit_hits
+  where restaurant_id = tests.l1() and limit_kind = kind and table_number = tbl
+$$;
+
+insert into tests.vars values ('q_otros_antes', to_jsonb(tests.other_orders()));
+insert into public.restaurants (id, slug, name, active, tables, pickup_enabled, online_payment_enabled, counter_payment_enabled)
+values (tests.l1(), 'limites-uno', 'Límites Uno', true, 10, true, true, true),
+       (tests.l2(), 'limites-dos', 'Límites Dos', true, 10, true, true, true);
+insert into public.categories (id, restaurant_id, name) values
+  ('f0000000-0000-4000-8000-000000000101', tests.l1(), 'Carta'), ('f0000000-0000-4000-8000-000000000102', tests.l2(), 'Carta');
+insert into public.products (id, restaurant_id, category_id, name, price_cents) values
+  (tests.l1_prod(), tests.l1(), 'f0000000-0000-4000-8000-000000000101', 'Menú', 500),
+  (tests.l2_prod(), tests.l2(), 'f0000000-0000-4000-8000-000000000102', 'Menú', 700);
+insert into auth.users (id, email) values (tests.u('f1'), 'owner@limites.test'), (tests.u('f2'), 'manager@limites.test'),
+  (tests.u('f3'), 'sala@limites.test'), (tests.u('f4'), 'cocina@limites.test'), (tests.u('f5'), 'owner@limites-dos.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values
+  (tests.l1(), tests.u('f1'), 'owner'), (tests.l1(), tests.u('f2'), 'manager'), (tests.l1(), tests.u('f3'), 'waiter'),
+  (tests.l1(), tests.u('f4'), 'kitchen'), (tests.l2(), tests.u('f5'), 'owner');
+
+-- 16.1 Valores por defecto y quién puede ver o cambiar los límites
+select tests.ok(not exists (select 1 from private.order_limits), 'límites: sin filas, todos los restaurantes usan los de por defecto');
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'q_lim_def', public.platform_get_order_limits(tests.l2());
+select tests.ok(tests.v('q_lim_def') @> '{"perTable": 8, "pickup": 15, "perRestaurant": 40, "onlinePending": 30, "windowMinutes": 30, "isDefault": true}',
+  'límites por defecto: 8 por mesa, 15 para recoger, 40 por restaurante, 30 online, 30 minutos', tests.v('q_lim_def')::text);
+reset role;
+set role anon;
+select tests.claims('anon', null);
+select tests.throws(format('select public.platform_set_order_limits(%L, 99, 99, 99, 99, 99)', tests.l1()), 'permission denied', 'anónimo: no puede cambiar los límites');
+select tests.throws(format('select public.platform_get_order_limits(%L)', tests.l1()), 'permission denied', 'anónimo: no puede ver los límites');
+reset role;
+set role authenticated;
+select tests.claims('authenticated', tests.u(c)), tests.throws(format('select public.platform_set_order_limits(%L, 99, 99, 99, 99, 99)', tests.l1()),
+  'Solo la plataforma', format('%s: no puede cambiar los límites de su restaurante', who))
+from (values ('f1', 'owner'), ('f2', 'manager'), ('f3', 'sala'), ('f4', 'cocina'), ('f5', 'owner de otro restaurante'), ('ee', 'sin rol')) v(c, who);
+select tests.claims('authenticated', tests.u('f1'));
+select tests.throws(format('select public.platform_get_order_limits(%L)', tests.l1()), 'Solo la plataforma', 'owner: no puede consultar los límites (solo la plataforma)');
+select tests.throws('select * from private.order_limits', 'permission denied', 'owner: no puede leer la tabla de límites');
+select tests.throws(format('insert into private.order_limits (restaurant_id, per_table) values (%L, 500)', tests.l1()), 'permission denied', 'owner: no puede escribir límites directamente');
+select tests.throws(format('select private.order_limit_reject(%L, %L, 1)', tests.l1(), 'mesa'), 'permission denied', 'owner: no puede anotar intentos falsos');
+select tests.throws(format('select private.order_limit_exceeded(%L, %L, %L, 1)', tests.l1(), 'mesa', 'caja'), 'permission denied', 'owner: no puede consultar recuentos internos');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.throws(format('select public.platform_set_order_limits(%L, %s)', tests.l1(), v.args), v.pat, 'plataforma: valor fuera de rango rechazado (' || v.args || ')')
+from (values ('0, 2, 8, 2, 30', 'por mesa'), ('501, 2, 8, 2, 30', 'por mesa'), ('3, 0, 8, 2, 30', 'para recoger'), ('3, 2, 1001, 2, 30', 'del restaurante'),
+             ('3, 2, 8, 0, 30', 'online'), ('3, 2, 8, 2, 0', 'ventana'), ('3, 2, 8, 2, 241', 'ventana'), ('null, 2, 8, 2, 30', 'por mesa')) v(args, pat);
+select tests.throws(format('select public.platform_set_order_limits(%L, 3, 2, 8, 2, 30)', gen_random_uuid()), 'Restaurante no encontrado', 'plataforma: restaurante inexistente rechazado');
+reset role;
+select tests.ok(not exists (select 1 from private.order_limits), 'los intentos rechazados no han guardado ningún límite');
+set role authenticated;
+select tests.claims('authenticated', tests.u('ad'));
+-- L1: 3 por mesa, 2 para recoger, 8 en el restaurante, 2 online pendientes, ventana de 30 minutos.
+insert into tests.vars select 'q_lim_set', public.platform_set_order_limits(tests.l1(), 3, 2, 8, 2, 30);
+select tests.ok(tests.v('q_lim_set') @> '{"perTable": 3, "pickup": 2, "perRestaurant": 8, "onlinePending": 2, "windowMinutes": 30, "isDefault": false}',
+  'plataforma: cambia los límites de un restaurante', tests.v('q_lim_set')::text);
+select tests.ok(public.platform_get_order_limits(tests.l2()) ->> 'isDefault' = 'true', 'cambiar los límites de un restaurante no afecta a otro');
+reset role;
+select tests.ok(exists (select 1 from private.audit_log where action = 'plataforma.limites_pedidos' and restaurant_id = tests.l1()
+  and actor_user_id = tests.u('ad') and details -> 'antes' ->> 'perTable' = '8' and details -> 'despues' ->> 'perTable' = '3'),
+  'auditoría: el cambio de límites queda registrado (antes y después)');
+
+-- 16.2 Límite por mesa (3) y qué pedidos cuentan
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'q_m' || i, public.create_order(tests.lp(50000 + i)) from generate_series(1, 3) i;
+select tests.ok(tests.created('q_m1') and tests.created('q_m2') and tests.created('q_m3'), 'mesa: los 3 primeros pedidos se crean');
+insert into tests.vars select 'q_m4', public.create_order(tests.lp(50004));
+select tests.ok(tests.rejected('q_m4', 'mesa'), 'mesa: el 4.º se rechaza con su motivo y mensaje', tests.v('q_m4')::text);
+select tests.ok(tests.v('q_m4') ->> 'message' = 'Hay muchos pedidos pendientes en esta mesa. Avisa al personal.', 'mesa: el mensaje pide avisar al personal');
+reset role;
+select tests.ok(tests.l1_count() = 3, 'mesa: el pedido rechazado no se ha guardado');
+select tests.ok(not exists (select 1 from private.order_access a where a.token_hash = private.token_hash(tests.tok(50004))), 'mesa: el rechazo no guarda código de seguimiento');
+-- La respuesta de rechazo marca la petición con el estado HTTP 429; un pedido creado no.
+set role anon;
+do $$ declare j jsonb; begin
+  j := public.create_order(tests.lp(50005));
+  insert into tests.vars values ('q_st_rej', jsonb_build_object('j', j, 'status', current_setting('response.status', true)));
+end $$;
+do $$ declare j jsonb; begin
+  j := public.create_order(tests.lp(50006, '{"table": 2}'));
+  insert into tests.vars values ('q_st_ok', jsonb_build_object('j', j, 'status', coalesce(current_setting('response.status', true), '')));
+end $$;
+select tests.ok(tests.v('q_st_rej') ->> 'status' = '429' and tests.v('q_st_rej') -> 'j' ->> 'rejected' = 'true', 'rechazo: la respuesta lleva el estado HTTP 429 (la app la recibe como error)');
+select tests.ok(tests.v('q_st_ok') ->> 'status' = '' and tests.v('q_st_ok') -> 'j' ? 'id', 'pedido creado: sin estado 429');
+-- Reintentos: con el código de un pedido ya creado devuelve ESE pedido aunque la mesa esté llena.
+insert into tests.vars select 'q_m2_bis', public.create_order(tests.lp(50002));
+select tests.ok(tests.id('q_m2_bis') = tests.id('q_m2'), 'reintento con el mismo código: devuelve el pedido ya creado, sin frenarlo');
+insert into tests.vars select 'q_m4_bis', public.create_order(tests.lp(50004));
+select tests.ok(tests.rejected('q_m4_bis', 'mesa'), 'reintento de un pedido rechazado: sigue rechazado (no se creó nada)');
+-- Cambiar de código o de método de pago no salta el límite de caja de la mesa.
+insert into tests.vars select 'q_m_otro', public.create_order(tests.lp(50007, '{"notes": "otro código"}'));
+select tests.ok(tests.rejected('q_m_otro', 'mesa'), 'otro código para la misma mesa: rechazado');
+-- En preparación y listo SIGUEN contando.
+reset role;
+select tests.claims('authenticated', tests.u('f3'));
+set role authenticated;
+select public.staff_set_prep_status(tests.id('q_m1'), 'en_preparacion');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m_prep', public.create_order(tests.lp(50008));
+select tests.ok(tests.rejected('q_m_prep', 'mesa'), '«en preparación» sigue contando: la mesa sigue llena');
+reset role;
+select tests.claims('authenticated', tests.u('f3'));
+set role authenticated;
+select public.staff_set_prep_status(tests.id('q_m1'), 'listo');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m_listo', public.create_order(tests.lp(50009));
+select tests.ok(tests.rejected('q_m_listo', 'mesa'), '«listo» sigue contando: la mesa sigue llena');
+-- Cobrar libera un hueco.
+reset role;
+select tests.claims('authenticated', tests.u('f3'));
+set role authenticated;
+select public.staff_mark_paid_at_counter(tests.id('q_m1'));
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m5', public.create_order(tests.lp(50010));
+select tests.ok(tests.created('q_m5'), 'cobrado en caja: deja de contar y entra un pedido nuevo');
+insert into tests.vars select 'q_m6', public.create_order(tests.lp(50011));
+select tests.ok(tests.rejected('q_m6', 'mesa'), 'y la mesa vuelve a estar llena');
+-- Entregar libera un hueco (aunque no esté cobrado: la comida llegó a una persona).
+reset role;
+select tests.claims('authenticated', tests.u('f3'));
+set role authenticated;
+select public.staff_set_prep_status(tests.id('q_m2'), 'en_preparacion');
+select public.staff_set_prep_status(tests.id('q_m2'), 'listo');
+select public.staff_set_prep_status(tests.id('q_m2'), 'entregado');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m7', public.create_order(tests.lp(50012));
+select tests.ok(tests.created('q_m7'), 'entregado: deja de contar y entra un pedido nuevo');
+-- Cancelar libera un hueco.
+reset role;
+select tests.claims('authenticated', tests.u('f3'));
+set role authenticated;
+select public.staff_set_prep_status(tests.id('q_m3'), 'cancelado');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m8', public.create_order(tests.lp(50013));
+select tests.ok(tests.created('q_m8'), 'cancelado: deja de contar y entra un pedido nuevo');
+insert into tests.vars select 'q_m9', public.create_order(tests.lp(50014));
+select tests.ok(tests.rejected('q_m9', 'mesa'), 'mesa llena otra vez (m5, m7, m8)');
+-- Ventana: un pedido creado hace más de 30 minutos deja de contar, SIN cambiar nada del pedido.
+-- (Solo en esta base desechable: se desactiva un momento el vigilante para simular el paso del tiempo.)
+reset role;
+select tests.claims(null, null);
+alter table public.orders disable trigger orders_guard;
+update public.orders set created_at = created_at - interval '31 minutes' where id = tests.id('q_m5');
+alter table public.orders enable trigger orders_guard;
+insert into tests.vars select 'q_m5_antes', to_jsonb(o) - 'updated_at' from public.orders o where o.id = tests.id('q_m5');
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_m10', public.create_order(tests.lp(50015));
+select tests.ok(tests.created('q_m10'), 'ventana: un pedido de hace más de 30 minutos ya no cuenta');
+reset role;
+select tests.ok((select to_jsonb(o) - 'updated_at' from public.orders o where o.id = tests.id('q_m5')) = tests.v('q_m5_antes'),
+  'ventana: el pedido antiguo NO se cancela ni cambia (sigue nuevo y pendiente de caja)');
+select tests.ok((select prep_status = 'nuevo' and payment_status = 'pendiente_caja' and total_cents = 500 from public.orders where id = tests.id('q_m5')),
+  'ventana: el pedido antiguo conserva su estado e importe');
+select tests.ok(tests.l1_count($$prep_status = 'cancelado'$$) = 1, 'nada se cancela solo: solo el pedido que canceló la sala');
+
+-- 16.3 Para recoger (2), restaurante (8) e independencia entre mesas
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'q_r' || i, public.create_order(tests.lp(50100 + i, '{"mode": "recoger", "customerName": "Ana", "pickupTime": "asap"}')) from generate_series(1, 3) i;
+select tests.ok(tests.created('q_r1') and tests.created('q_r2') and tests.rejected('q_r3', 'recoger'), 'recoger: 2 se crean y el 3.º se rechaza', tests.v('q_r3')::text);
+-- Abiertos sin pagar en la ventana: mesa 1 (m7, m8, m10), mesa 2 (st_ok), recoger (r1, r2) = 6 de 8.
+insert into tests.vars select 'q_t3a', public.create_order(tests.lp(50201, '{"table": 3}'));
+insert into tests.vars select 'q_t3b', public.create_order(tests.lp(50202, '{"table": 3}'));
+select tests.ok(tests.created('q_t3a') and tests.created('q_t3b'), 'otra mesa con hueco: se crean pedidos aunque la mesa 1 esté llena');
+insert into tests.vars select 'q_t3c', public.create_order(tests.lp(50203, '{"table": 3}'));
+insert into tests.vars select 'q_t4a', public.create_order(tests.lp(50204, '{"table": 4}'));
+select tests.ok(tests.rejected('q_t3c', 'restaurante') and tests.rejected('q_t4a', 'restaurante'), 'restaurante: con 8 sin pagar, se rechaza en cualquier mesa', tests.v('q_t4a')::text);
+insert into tests.vars select 'q_r_full', public.create_order(tests.lp(50205, '{"mode": "recoger", "customerName": "Luis"}'));
+select tests.ok(tests.rejected('q_r_full', 'recoger') or tests.rejected('q_r_full', 'restaurante'), 'restaurante lleno: recoger también se rechaza');
+-- Otro restaurante no se ve afectado (L2 con los límites por defecto).
+insert into tests.vars select 'q_l2_' || i, public.create_order(tests.lp2(50300 + i)) from generate_series(1, 5) i;
+select tests.ok((select bool_and(tests.created('q_l2_' || i)) from generate_series(1, 5) i), 'otro restaurante: sus pedidos entran aunque L1 esté lleno');
+
+-- 16.4 Online pendientes (2) y paso a caja
+insert into tests.vars select 'q_on1', public.create_order(tests.lp(50401, '{"paymentMethod": "online", "table": 5}'));
+insert into tests.vars select 'q_on2', public.create_order(tests.lp(50402, '{"paymentMethod": "online", "table": 1}'));
+select tests.ok(tests.created('q_on1') and tests.created('q_on2'), 'online: los pedidos online no cuentan para los límites de caja');
+insert into tests.vars select 'q_on3', public.create_order(tests.lp(50403, '{"paymentMethod": "online", "table": 6}'));
+select tests.ok(tests.rejected('q_on3', 'online'), 'online: con 2 pendientes de pago, el 3.º se rechaza', tests.v('q_on3')::text);
+-- Pasar a caja aplica los límites de caja: on2 es de la mesa 1 (llena), on1 de la mesa 5 (restaurante lleno).
+insert into tests.vars select 'q_sw2', public.customer_switch_to_counter(tests.id('q_on2'), tests.tok(50402));
+select tests.ok(tests.rejected('q_sw2', 'mesa'), 'pasar a caja: rechazado si la mesa está llena', tests.v('q_sw2')::text);
+insert into tests.vars select 'q_sw1', public.customer_switch_to_counter(tests.id('q_on1'), tests.tok(50401));
+select tests.ok(tests.rejected('q_sw1', 'restaurante'), 'pasar a caja: rechazado si el restaurante está lleno', tests.v('q_sw1')::text);
+do $$ declare j jsonb; begin
+  j := public.customer_switch_to_counter(tests.id('q_on1'), tests.tok(50401));
+  insert into tests.vars values ('q_sw_st', to_jsonb(current_setting('response.status', true)));
+exception when others then  -- si el cambio se hubiera aplicado, no debe detener la batería: falla la prueba
+  insert into tests.vars values ('q_sw_st', to_jsonb('error: ' || sqlerrm));
+end $$;
+select tests.ok(tests.v('q_sw_st') #>> '{}' = '429', 'pasar a caja rechazado: estado HTTP 429');
+reset role;
+select tests.ok((select payment_method = 'online' and payment_status = 'pendiente_online' and prep_status = 'nuevo' from public.orders where id = tests.id('q_on1'))
+  and (select payment_method = 'online' and payment_status = 'pendiente_online' from public.orders where id = tests.id('q_on2')),
+  'pasar a caja rechazado: el pedido NO cambia (sigue online pendiente, fuera de cocina)');
+select tests.claims('authenticated', tests.u('f4'));
+set role authenticated;
+select tests.ok(not tests.in_kitchen(tests.l1(), tests.id('q_on1')), 'pasar a caja rechazado: el pedido no aparece en cocina');
+-- Si se libera hueco, el cambio a caja funciona.
+select tests.claims('authenticated', tests.u('f3'));
+select public.staff_set_prep_status(tests.id('q_t3a'), 'cancelado');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+do $$ begin
+  insert into tests.vars select 'q_sw1_ok', public.customer_switch_to_counter(tests.id('q_on1'), tests.tok(50401));
+exception when others then
+  insert into tests.vars values ('q_sw1_ok', jsonb_build_object('error', sqlerrm));
+end $$;
+select tests.ok(tests.v('q_sw1_ok') ->> 'paymentStatus' = 'pendiente_caja' and tests.id('q_sw1_ok') = tests.id('q_on1'), 'pasar a caja: con hueco, funciona');
+insert into tests.vars select 'q_on4', public.create_order(tests.lp(50404, '{"paymentMethod": "online", "table": 7}'));
+select tests.ok(tests.created('q_on4'), 'online: el pedido pasado a caja deja de contar como online pendiente');
+
+-- 16.5 Registro de intentos frenados: agrupado, y solo lo ven owner y manager de su restaurante (y la plataforma)
+reset role;
+select tests.ok(tests.hits('mesa', 1) = 9, 'registro: cada intento frenado en la mesa 1 se cuenta (9)', tests.hits('mesa', 1)::text);
+select tests.ok(tests.hits('recoger') >= 1 and tests.hits('restaurante') >= 3 and tests.hits('online') = 1, 'registro: también recoger, restaurante y online',
+  format('recoger %s, restaurante %s, online %s', tests.hits('recoger'), tests.hits('restaurante'), tests.hits('online')));
+select tests.ok((select count(*) from private.order_limit_hits where restaurant_id = tests.l1() and limit_kind = 'mesa' and table_number = 1) <= 2,
+  'registro: los intentos repetidos se agrupan (no una fila por intento)');
+select tests.ok(not exists (select 1 from private.order_limit_hits where restaurant_id <> tests.l1()), 'registro: no hay intentos de otros restaurantes');
+select tests.claims('authenticated', tests.u('f1'));
+set role authenticated;
+insert into tests.vars select 'q_hits_owner', public.order_limit_hits_list(tests.l1());
+select tests.ok(jsonb_array_length(tests.v('q_hits_owner')) >= 4 and tests.v('q_hits_owner') @> '[{"limit": "mesa", "table": 1}]',
+  'owner: ve los intentos frenados de su restaurante', tests.v('q_hits_owner')::text);
+select tests.ok(not (tests.v('q_hits_owner')::text ~* 'token|accessToken|phone|telefono|"id"'), 'owner: el registro no contiene códigos ni datos de clientes');
+select tests.claims('authenticated', tests.u('f2'));
+select tests.ok(jsonb_array_length(public.order_limit_hits_list(tests.l1())) >= 4, 'manager: ve los intentos frenados de su restaurante');
+select tests.claims('authenticated', tests.u(c)), tests.throws(format('select public.order_limit_hits_list(%L)', tests.l1()),
+  'No tienes acceso', format('%s: no ve los intentos frenados', who))
+from (values ('f3', 'sala'), ('f4', 'cocina'), ('f5', 'owner de otro restaurante'), ('a1', 'owner de La Piazza'), ('ee', 'sin rol')) v(c, who);
+select tests.claims('authenticated', tests.u('f5'));
+select tests.ok(public.order_limit_hits_list(tests.l2()) = '[]'::jsonb, 'owner de otro restaurante: en el suyo no ve nada de L1');
+select tests.claims('authenticated', tests.u('f1'));
+select tests.throws(format('select public.order_limit_hits_list(%L)', tests.l2()), 'No tienes acceso', 'owner: no ve los intentos de otro restaurante');
+select tests.throws('select * from private.order_limit_hits', 'permission denied', 'owner: no puede leer la tabla de intentos directamente');
+select tests.throws('delete from private.order_limit_hits', 'permission denied', 'owner: no puede borrar intentos');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.ok(jsonb_array_length(public.order_limit_hits_list(tests.l1(), 2)) = 2, 'plataforma: ve los intentos frenados (con límite de filas)');
+reset role;
+select tests.ok(exists (select 1 from private.audit_log where action = 'plataforma.consulta_limites_pedidos' and restaurant_id = tests.l1() and actor_user_id = tests.u('ad')),
+  'auditoría: la consulta de la plataforma queda registrada');
+set role anon;
+select tests.claims('anon', null);
+select tests.throws(format('select public.order_limit_hits_list(%L)', tests.l1()), 'permission denied', 'anónimo: no ve los intentos frenados');
+select tests.throws(format('select private.order_limit_reject(%L, %L, 1)', tests.l1(), 'mesa'), 'permission denied', 'anónimo: no puede anotar intentos');
+reset role;
+set role service_role;
+select tests.claims('service_role', null);
+select tests.throws(format('select private.order_limit_reject(%L, %L, 1)', tests.l1(), 'mesa'), 'permission denied', 'servidor: no puede anotar intentos');
+select tests.throws(format('select public.platform_set_order_limits(%L, 99, 99, 99, 99, 99)', tests.l1()), 'permission denied', 'servidor: no puede cambiar los límites');
+select tests.throws('select * from private.order_limits', 'permission denied', 'servidor: no puede leer los límites');
+reset role;
+
+-- 16.6 Los demás pedidos (La Piazza, Otro Sitio…) no han cambiado
+select tests.claims(null, null);
+select tests.ok(tests.other_orders() = tests.v('q_otros_antes') #>> '{}', 'los pedidos de los demás restaurantes siguen intactos (estados, importes, fechas)');
+select tests.ok(exists (select 1 from pg_indexes where indexname = 'orders_unpaid_open_idx'), 'existe el índice para contar los pedidos sin pagar');
+
 -- ===================== Resultado =====================
 \o
 \set QUIET 0
