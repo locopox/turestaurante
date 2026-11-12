@@ -2053,6 +2053,232 @@ select tests.claims(null, null);
 select tests.ok(tests.other_orders() = tests.v('q_otros_antes') #>> '{}', 'los pedidos de los demás restaurantes siguen intactos (estados, importes, fechas)');
 select tests.ok(exists (select 1 from pg_indexes where indexname = 'orders_unpaid_open_idx'), 'existe el índice para contar los pedidos sin pagar');
 
+-- ===================== 17. CUENTA COMERCIAL DE LOS RESTAURANTES (BASE, SIN BLOQUEOS) =====================
+reset role;
+select tests.claims(null, null);
+create function tests.c1() returns uuid language sql immutable as $$ select 'c7000000-0000-4000-8000-000000000001'::uuid $$;
+create function tests.c_antiguo() returns uuid language sql immutable as $$ select 'c7000000-0000-4000-8000-000000000002'::uuid $$;
+create function tests.acc(rid uuid) returns private.tenant_accounts language sql stable as $$
+  select a from private.tenant_accounts a where a.restaurant_id = rid
+$$;
+-- Ejecuta una sentencia como SQL Editor y devuelve el error (o 'ok'): sirve para comprobar las reglas
+-- de la cuenta comercial, que se aplican a TODOS, también a quien tiene acceso completo.
+create function tests.try(q text) returns text language plpgsql as $$
+begin execute q; return 'ok'; exception when others then return sqlerrm; end $$;
+
+-- 17.1 Todos los restaurantes tienen exactamente una cuenta; los creados después del esquema, «borrador»
+select tests.ok((select count(*) from public.restaurants) = (select count(*) from private.tenant_accounts)
+  and not exists (select 1 from public.restaurants r where not exists (select 1 from private.tenant_accounts a where a.restaurant_id = r.id)),
+  'cuenta comercial: una por restaurante, ninguno sin cuenta');
+select tests.ok((tests.acc(tests.piazza())).status = 'borrador' and (tests.acc(tests.piazza())).origin = 'alta'
+  and (tests.acc(tests.piazza())).plan_code is null and (tests.acc(tests.piazza())).trial_started_at is null,
+  'restaurante creado después del sistema comercial (seed, instalación nueva): borrador, sin plan ni prueba');
+select tests.ok(not exists (select 1 from private.tenant_accounts where status = 'sin_asignar' and origin <> 'existente'),
+  'nadie tiene «sin_asignar» salvo los restaurantes que ya existían');
+
+-- 17.2 Cualquier forma de crear un restaurante → «borrador»
+insert into public.restaurants (id, slug, name, active) values (tests.c1(), 'comercial-uno', 'Comercial Uno', true);
+select tests.ok((tests.acc(tests.c1())).status = 'borrador', 'restaurante nuevo desde el SQL Editor: borrador (aunque se cree abierto)');
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into tests.vars select 'c_plat', public.platform_create_restaurant('Comercial Plataforma', 'comercial-plataforma', 'duena@comercial.test');
+reset role;
+select tests.ok((tests.acc((tests.v('c_plat') ->> 'restaurantId')::uuid)).status = 'borrador', 'restaurante creado por la plataforma: borrador');
+select tests.claims('authenticated', tests.u('ad'));
+set role authenticated;
+insert into public.restaurants (slug, name) values ('comercial-api', 'Comercial API');
+reset role;
+select tests.ok((select a.status = 'borrador' from private.tenant_accounts a join public.restaurants r on r.id = a.restaurant_id where r.slug = 'comercial-api'),
+  'restaurante creado por la API (plataforma): borrador');
+
+-- 17.3 Restaurantes que ya existían: la migración les da «sin_asignar» (simulado: uno creado sin el trigger)
+select tests.claims(null, null);
+alter table public.restaurants disable trigger restaurants_tenant_account;
+insert into public.restaurants (id, slug, name, active) values (tests.c_antiguo(), 'comercial-antiguo', 'Comercial Antiguo', true);
+alter table public.restaurants enable trigger restaurants_tenant_account;
+insert into tests.vars values ('c_antes', (select jsonb_agg(to_jsonb(a) order by a.restaurant_id) from private.tenant_accounts a));
+-- La misma sentencia que schema.sql y la migración
+insert into private.tenant_accounts (restaurant_id, status, origin)
+select r.id, 'sin_asignar', 'existente' from public.restaurants r
+where not exists (select 1 from private.tenant_accounts a where a.restaurant_id = r.id)
+on conflict (restaurant_id) do nothing;
+select tests.ok((tests.acc(tests.c_antiguo())).status = 'sin_asignar' and (tests.acc(tests.c_antiguo())).origin = 'existente',
+  'restaurante que ya existía: sin_asignar (conserva su situación)');
+select tests.ok((select jsonb_agg(to_jsonb(a) order by a.restaurant_id) from private.tenant_accounts a where a.restaurant_id <> tests.c_antiguo())
+  = tests.v('c_antes'), 'crear las cuentas que faltan no cambia ninguna cuenta existente');
+select tests.ok(tests.try($$insert into private.tenant_accounts (restaurant_id, status, origin)
+  select r.id, 'sin_asignar', 'existente' from public.restaurants r
+  where not exists (select 1 from private.tenant_accounts a where a.restaurant_id = r.id) on conflict (restaurant_id) do nothing$$) = 'ok'
+  and (select count(*) from private.tenant_accounts) = (select count(*) from public.restaurants), 'repetirlo no crea ni cambia nada');
+
+-- 17.4 Nadie de la API lee ni escribe las cuentas comerciales ni los planes
+select tests.claims('anon', null);
+set role anon;
+select tests.throws('select * from private.tenant_accounts', 'permission denied', 'anónimo: no puede leer las cuentas comerciales');
+select tests.throws('select * from private.commercial_plans', 'permission denied', 'anónimo: no puede leer los planes');
+select tests.throws(format('select public.restaurant_commercial_status(%L)', tests.piazza()), 'permission denied', 'anónimo: no puede consultar el estado comercial');
+reset role;
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.throws('select * from private.tenant_accounts', 'permission denied', 'owner: no puede leer la tabla de cuentas');
+select tests.throws(format($$update private.tenant_accounts set status = 'activa' where restaurant_id = %L$$, tests.piazza()), 'permission denied', 'owner: no puede cambiar su estado comercial');
+select tests.throws(format($$update private.tenant_accounts set trial_ends_at = now() + interval '1 year' where restaurant_id = %L$$, tests.piazza()), 'permission denied', 'owner: no puede cambiar las fechas de la prueba');
+select tests.throws(format($$update private.tenant_accounts set plan_code = 'profesional' where restaurant_id = %L$$, tests.piazza()), 'permission denied', 'owner: no puede cambiar su plan');
+select tests.throws(format($$insert into private.tenant_accounts (restaurant_id, status) values (%L, 'activa')$$, gen_random_uuid()), 'permission denied', 'owner: no puede crear cuentas');
+select tests.throws(format($$delete from private.tenant_accounts where restaurant_id = %L$$, tests.piazza()), 'permission denied', 'owner: no puede borrar su cuenta');
+select tests.throws($$insert into private.commercial_plans (code, name) values ('gratis', 'Gratis')$$, 'permission denied', 'owner: no puede crear planes');
+-- Lo que sí puede hacer (editar su restaurante) no toca su cuenta comercial
+reset role;
+insert into tests.vars values ('c_piazza', to_jsonb(tests.acc(tests.piazza())));
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+select tests.ok(tests.affected(format($$update public.restaurants set tagline = 'Nueva descripción' where id = %L$$, tests.piazza())) = 1,
+  'owner: sigue pudiendo editar su restaurante');
+reset role;
+select tests.ok(to_jsonb(tests.acc(tests.piazza())) = tests.v('c_piazza'), 'editar el restaurante no cambia su cuenta comercial');
+select tests.ok(not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'restaurants'
+  and column_name ~ 'status|plan|trial|commercial|subscription'), 'la tabla pública de restaurantes no tiene datos comerciales');
+set role service_role;
+select tests.claims('service_role', null);
+select tests.throws('select * from private.tenant_accounts', 'permission denied', 'servidor (service_role): no puede leer las cuentas por la API');
+select tests.throws(format('select public.restaurant_commercial_status(%L)', tests.piazza()), 'permission denied', 'servidor: no puede usar la consulta del personal');
+reset role;
+
+-- 17.5 Reglas que se aplican a TODOS (aquí como SQL Editor, con acceso completo)
+select tests.claims(null, null);
+select tests.ok(tests.try(format($$insert into private.tenant_accounts (restaurant_id, status) values (%L, 'activa')$$, gen_random_uuid())) ~ 'empieza como borrador',
+  'reglas: una cuenta nueva no puede nacer activa');
+select tests.ok(tests.try(format($$insert into private.tenant_accounts (restaurant_id, status, origin) values (%L, 'sin_asignar', 'alta')$$, tests.c1())) ~ 'tenant_accounts_unassigned_only_existing|duplicate',
+  'reglas: «sin_asignar» solo para restaurantes que ya existían');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'sin_asignar' where restaurant_id = %L$$, tests.c1())) ~ 'no permitido|unassigned',
+  'reglas: nadie puede pasar a «sin_asignar»');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'vencida' where restaurant_id = %L$$, tests.c1())) ~ 'no permitido',
+  'reglas: de borrador no se pasa a vencida');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba', plan_code = 'profesional',
+  trial_started_at = now() - interval '1 day', trial_ends_at = now() + interval '13 days' where restaurant_id = %L$$, tests.c1())) ~ 'no se pueden elegir',
+  'reglas: la prueba no puede empezar en el pasado');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba', plan_code = 'profesional',
+  trial_started_at = now(), trial_ends_at = now() + interval '30 days' where restaurant_id = %L$$, tests.c1())) ~ 'no se pueden elegir',
+  'reglas: la prueba no puede durar más de 14 días al empezar');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba',
+  trial_started_at = now(), trial_ends_at = now() + interval '14 days' where restaurant_id = %L$$, tests.c1())) ~ 'tenant_accounts_trial_complete',
+  'reglas: la prueba necesita plan');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba', plan_code = 'inventado',
+  trial_started_at = now(), trial_ends_at = now() + interval '14 days' where restaurant_id = %L$$, tests.c1())) ~ 'foreign key',
+  'reglas: solo planes que existen');
+select tests.ok((tests.acc(tests.c1())).status = 'borrador' and (tests.acc(tests.c1())).trial_started_at is null, 'los intentos rechazados no han cambiado nada');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba', plan_code = 'profesional',
+  trial_started_at = now(), trial_ends_at = now() + interval '14 days' where restaurant_id = %L$$, tests.c1())) = 'ok',
+  'reglas: la prueba empieza ahora y por 14 días exactos');
+select tests.ok((tests.acc(tests.c1())).trial_ends_at = (tests.acc(tests.c1())).trial_started_at + interval '14 days', 'prueba: fin = inicio + 14 días');
+select tests.ok(tests.try(format($$update private.tenant_accounts set trial_started_at = trial_started_at - interval '1 day' where restaurant_id = %L$$, tests.c1())) ~ 'no se puede cambiar',
+  'reglas: el inicio de la prueba no se puede cambiar');
+select tests.ok(tests.try(format($$update private.tenant_accounts set trial_ends_at = trial_ends_at - interval '1 day' where restaurant_id = %L$$, tests.c1())) ~ 'no se puede adelantar',
+  'reglas: el fin de la prueba no se puede adelantar');
+select tests.ok(tests.try(format($$update private.tenant_accounts set trial_ends_at = null, trial_started_at = null where restaurant_id = %L$$, tests.c1())) ~ 'no se puede cambiar|trial',
+  'reglas: la prueba no se puede borrar');
+select tests.ok(tests.try(format($$update private.tenant_accounts set trial_ends_at = trial_ends_at + interval '2 days' where restaurant_id = %L$$, tests.c1())) = 'ok',
+  'reglas: el fin de la prueba sí se puede retrasar (ampliación)');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'borrador' where restaurant_id = %L$$, tests.c1())) ~ 'no permitido',
+  'reglas: de prueba no se vuelve a borrador');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'vencida' where restaurant_id = %L$$, tests.c1())) = 'ok'
+  and tests.try(format($$update private.tenant_accounts set status = 'activa' where restaurant_id = %L$$, tests.c1())) = 'ok'
+  and tests.try(format($$update private.tenant_accounts set status = 'vencida' where restaurant_id = %L$$, tests.c1())) = 'ok',
+  'reglas: prueba → vencida → activa → vencida');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba' where restaurant_id = %L$$, tests.c1())) ~ 'no permitido',
+  'reglas: no hay una segunda prueba gratuita');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'prueba', plan_code = 'profesional',
+  trial_started_at = now(), trial_ends_at = now() + interval '14 days' where restaurant_id = %L$$, tests.c_antiguo())) ~ 'no permitido|borrador',
+  'reglas: un restaurante que ya existía no recibe una prueba retroactiva');
+select tests.ok(tests.try(format($$update private.tenant_accounts set status = 'activa' where restaurant_id = %L$$, tests.c_antiguo())) = 'ok',
+  'reglas: a un restaurante que ya existía se le puede asignar una modalidad (activa)');
+select tests.ok(tests.try(format($$update private.tenant_accounts set restaurant_id = %L where restaurant_id = %L$$, gen_random_uuid(), tests.c1())) ~ 'pertenece|foreign key',
+  'reglas: la cuenta no cambia de restaurante');
+select tests.ok(tests.try(format($$update private.tenant_accounts set origin = 'existente' where restaurant_id = %L$$, tests.c1())) ~ 'origen',
+  'reglas: el origen no se puede cambiar');
+select tests.ok(tests.try(format($$delete from private.tenant_accounts where restaurant_id = %L$$, tests.c1())) ~ 'no se puede borrar',
+  'reglas: la cuenta no se borra mientras exista el restaurante');
+select tests.ok(tests.try('truncate private.tenant_accounts') ~ 'no se pueden vaciar', 'reglas: las cuentas no se pueden vaciar');
+select tests.ok((select count(*) from private.audit_log where action = 'comercial.cambio' and restaurant_id = tests.c1()) >= 5
+  and exists (select 1 from private.audit_log where action = 'comercial.cambio' and restaurant_id = tests.c1()
+    and details -> 'antes' ->> 'estado' = 'borrador' and details -> 'despues' ->> 'estado' = 'prueba')
+  and exists (select 1 from private.audit_log where action = 'comercial.alta' and restaurant_id = tests.c1()),
+  'auditoría: el alta y cada cambio comercial quedan registrados (antes y después)');
+
+-- 17.6 Consulta del estado comercial: owner y manager de SU restaurante, y la plataforma
+insert into auth.users (id, email) values (tests.u('e1'), 'owner@comercial.test'), (tests.u('e2'), 'manager@comercial.test'), (tests.u('e3'), 'sala@comercial.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values
+  (tests.c1(), tests.u('e1'), 'owner'), (tests.c1(), tests.u('e2'), 'manager'), (tests.c1(), tests.u('e3'), 'waiter');
+select tests.claims('authenticated', tests.u('a1'));
+set role authenticated;
+insert into tests.vars select 'c_st_piazza', public.restaurant_commercial_status(tests.piazza());
+select tests.ok(tests.v('c_st_piazza') ->> 'status' = 'borrador' and tests.v('c_st_piazza') ->> 'restaurantId' = tests.piazza()::text,
+  'owner: consulta el estado comercial de su restaurante');
+select tests.ok((select array_agg(k order by k) from jsonb_object_keys(tests.v('c_st_piazza')) k)
+  = array['plan', 'planName', 'restaurantId', 'serverNow', 'status', 'trialEndsAt', 'trialSecondsLeft', 'trialStartedAt'],
+  'la consulta solo devuelve el estado, el plan y las fechas (sin quién lo cambió ni datos internos)', tests.v('c_st_piazza')::text);
+select tests.claims('authenticated', tests.u('e1'));
+insert into tests.vars select 'c_st_c1', public.restaurant_commercial_status(tests.c1());
+select tests.ok(tests.v('c_st_c1') ->> 'status' = 'vencida', 'owner de otro restaurante: ve el suyo');
+select tests.claims('authenticated', tests.u('e2'));
+select tests.ok(public.restaurant_commercial_status(tests.c1()) ->> 'status' = 'vencida', 'manager: consulta el estado comercial de su restaurante');
+select tests.claims('authenticated', tests.u(c)), tests.throws(format('select public.restaurant_commercial_status(%L)', r),
+  'No tienes acceso al estado comercial', who)
+from (values ('e3', tests.c1(), 'sala: no ve el estado comercial'), ('a4', tests.piazza(), 'cocina: no ve el estado comercial'),
+             ('e1', tests.piazza(), 'owner de otro restaurante: no ve el estado comercial de La Piazza'),
+             ('a1', tests.c1(), 'owner de La Piazza: no ve el estado comercial de otro restaurante'),
+             ('ee', tests.piazza(), 'sin rol: no ve el estado comercial'),
+             ('a1', gen_random_uuid(), 'restaurante que no existe: el mismo rechazo (no se puede sondear)')) v(c, r, who);
+select tests.claims('authenticated', tests.u('a1'));
+select tests.throws('select public.platform_list_commercial_accounts()', 'Solo la plataforma', 'owner: no puede ver las cuentas de todos');
+-- Una prueba en curso: los segundos que quedan los calcula la base de datos
+reset role;
+insert into public.restaurants (id, slug, name) values ('c7000000-0000-4000-8000-000000000003', 'comercial-prueba', 'Comercial Prueba');
+select tests.ok(tests.try($$update private.tenant_accounts set status = 'prueba', plan_code = 'profesional', trial_started_at = now(),
+  trial_ends_at = now() + interval '14 days' where restaurant_id = 'c7000000-0000-4000-8000-000000000003'$$) = 'ok',
+  'un restaurante nuevo (borrador) puede empezar su prueba');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values ('c7000000-0000-4000-8000-000000000003', tests.u('e1'), 'owner');
+select tests.claims('authenticated', tests.u('e1'));
+set role authenticated;
+insert into tests.vars select 'c_st_prueba', public.restaurant_commercial_status('c7000000-0000-4000-8000-000000000003');
+select tests.ok(tests.v('c_st_prueba') ->> 'status' = 'prueba' and tests.v('c_st_prueba') ->> 'plan' = 'profesional'
+  and tests.v('c_st_prueba') ->> 'planName' = 'Profesional'
+  and (tests.v('c_st_prueba') ->> 'trialSecondsLeft')::bigint between 14 * 86400 - 60 and 14 * 86400,
+  'prueba en curso: plan Profesional y tiempo restante calculado por la base de datos', tests.v('c_st_prueba')::text);
+-- Plataforma
+select tests.claims('authenticated', tests.u('ad'));
+insert into tests.vars select 'c_list', public.platform_list_commercial_accounts();
+select tests.ok(jsonb_array_length(tests.v('c_list')) = (select count(*) from public.restaurants)
+  and tests.v('c_list') @> jsonb_build_array(jsonb_build_object('restaurantId', tests.c_antiguo(), 'status', 'activa', 'origin', 'existente')),
+  'plataforma: ve la cuenta comercial de todos los restaurantes');
+select tests.ok((select bool_and(e ->> 'status' = 'borrador') and count(*) > 0 from jsonb_array_elements(public.platform_list_commercial_accounts('borrador')) e),
+  'plataforma: puede filtrar por estado');
+select tests.ok(jsonb_array_length(public.platform_list_commercial_accounts(null, 2)) = 2, 'plataforma: con límite de filas');
+select tests.throws($$select public.platform_list_commercial_accounts('inventado')$$, 'no válido', 'plataforma: estado inventado rechazado');
+select tests.ok(public.restaurant_commercial_status(tests.c1()) ->> 'status' = 'vencida', 'plataforma: consulta cualquier restaurante');
+select tests.throws(format('select public.restaurant_commercial_status(%L)', gen_random_uuid()), 'no encontrado', 'plataforma: restaurante inexistente');
+reset role;
+
+-- 17.7 En esta etapa el estado comercial NO bloquea nada: los pedidos funcionan igual que antes
+update public.restaurants set active = true where id = tests.c1();
+insert into public.categories (id, restaurant_id, name) values ('c7000000-0000-4000-8000-000000000101', tests.c1(), 'Carta');
+insert into public.products (id, restaurant_id, category_id, name, price_cents)
+values ('c7000000-0000-4000-8000-000000000201', tests.c1(), 'c7000000-0000-4000-8000-000000000101', 'Menú', 800);
+select tests.claims('anon', null);
+set role anon;
+insert into tests.vars select 'c_pedido', public.create_order(jsonb_build_object('restaurantId', tests.c1(), 'mode', 'mesa', 'table', 1,
+  'paymentMethod', 'caja', 'accessToken', tests.tok(77001),
+  'items', jsonb_build_array(jsonb_build_object('productId', 'c7000000-0000-4000-8000-000000000201', 'quantity', 1))));
+select tests.ok(tests.v('c_pedido') ? 'id' and tests.v('c_pedido') ->> 'total' = '800',
+  'sin bloqueos todavía: un restaurante «vencido» sigue aceptando pedidos como antes');
+reset role;
+
+-- 17.8 Borrar un restaurante (sin pedidos) borra su cuenta comercial
+select tests.claims(null, null);
+select tests.ok(tests.try($$delete from public.restaurants where slug = 'comercial-api'$$) = 'ok'
+  and not exists (select 1 from private.tenant_accounts a where not exists (select 1 from public.restaurants r where r.id = a.restaurant_id)),
+  'borrar un restaurante borra su cuenta comercial (en cascada)');
+
 -- ===================== Resultado =====================
 \o
 \set QUIET 0
