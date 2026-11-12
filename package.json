@@ -16,6 +16,7 @@
     "test:local:integration": "node supabase/tests/local/integration_test.mjs",
     "test:e2e:local": "playwright test --project=supabase-local",
     "test:e2e:demo": "playwright test --project=demo",
+    "test:e2e:qr": "playwright test --project=qr --project=qr-build",
     "test:local:isolation": "node supabase/tests/local/kitchen_isolation_test.mjs",
     "test:local:orders": "node supabase/tests/local/orders_security_test.mjs"
   },

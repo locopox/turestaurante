@@ -200,6 +200,7 @@ npm run test:db         # seguridad del SQL y entregas simultáneas: necesita un
 npm run test:migration  # migraciones fases 3 a 6: subida, repetición y bajada (PostgreSQL LOCAL)
 npm run test:recovery   # recuperación programada: necesita pg_cron en el PostgreSQL LOCAL (si no, se omite)
 npm run test:e2e:demo   # navegador (Playwright): el modo demo sigue funcionando
+npm run test:e2e:qr     # navegador: enlaces de los QR (/r/…), rutas con # y direcciones incorrectas
 # Con Supabase LOCAL (CLI + Docker), ver supabase/tests/local/README.md:
 npm run test:local:integration  # invitaciones de extremo a extremo por API (Auth, correo, permisos, límites)
 npm run test:e2e:local  # recorridos de invitaciones en el navegador contra Supabase local
@@ -313,5 +314,37 @@ La base de datos ya está preparada; falta la pasarela. **Nada en la app llama t
 
 ## Rutas
 
-Se usan rutas por hash para que funcione en cualquier alojamiento estático. Los QR ya codifican la URL de producción
-prevista (`VITE_PUBLIC_BASE_URL/r/<slug>/mesa/<n>`); al pasar a un router con rutas reales, hay que mapearlas a la vista de cliente.
+La app usa rutas con `#` (`#pedir-<slug>-mesa-<n>`, `#panel`, `#admin`…) para funcionar en cualquier alojamiento estático,
+y se compila con rutas relativas (`base: './'`).
+
+Los **códigos QR** apuntan a `VITE_PUBLIC_BASE_URL/r/<slug>` (para recoger) y `VITE_PUBLIC_BASE_URL/r/<slug>/mesa/<n>`.
+Un pequeño script al principio de `index.html` convierte esas direcciones, **antes de cargar la app**, en la equivalente
+con `#` (por ejemplo `/r/la-piazza/mesa/5` → `/#pedir-la-piazza-mesa-5`), en el mismo sitio y la misma carpeta, y conserva
+los parámetros (`?origen=qr`). Solo acepta direcciones de restaurante válidas y mesas de 1 a 999; con cualquier otra
+dirección no hace nada y nunca redirige a otro sitio. Los enlaces con `#` no cambian.
+
+**Para que funcione en producción, el alojamiento tiene que mostrar la app en las direcciones `/r/…`**, que no existen
+como archivos. Basta con UNA de estas dos cosas:
+
+- devolver `index.html` en las rutas que no existen (lo habitual en aplicaciones de una sola página), o
+- devolver `404.html`: la compilación (`npm run build`) lo genera, idéntico a `index.html`.
+
+| Alojamiento | Qué hace falta |
+|---|---|
+| GitHub Pages | Nada: usa `404.html` automáticamente |
+| Cloudflare Pages | Nada: usa `404.html` automáticamente |
+| Netlify | Archivo `_redirects` con `/* /index.html 200` (o `404.html`, que Netlify también muestra) |
+| Vercel | `vercel.json` con `{ "rewrites": [{ "source": "/r/(.*)", "destination": "/index.html" }] }` |
+| Nginx | `location / { try_files $uri $uri/ /index.html; }` |
+| Apache | `FallbackResource /index.html` (o `ErrorDocument 404 /404.html`) |
+| Firebase Hosting | `"rewrites": [{ "source": "/r/**", "destination": "/index.html" }]` |
+
+Si la app se publica en una subcarpeta (`https://dominio/turestaurante/`), `VITE_PUBLIC_BASE_URL` debe incluirla y la regla
+del alojamiento debe apuntar al `index.html` de esa carpeta.
+
+**Comprobación después de publicar:** abre `https://<tu-dominio>/r/<slug>/mesa/1` desde el móvil (o escanea un QR):
+debe mostrarse la carta con la mesa 1 y la dirección debe quedar en `…/#pedir-<slug>-mesa-1`. Si ves un error 404 o una
+página en blanco, falta la regla del alojamiento.
+
+Pruebas: `src/__tests__/qrRedirect.test.ts` (el script, con direcciones válidas e incorrectas) y `npm run test:e2e:qr`
+(navegador: servidor de desarrollo y app compilada en una carpeta temporal, nunca en `dist/`).

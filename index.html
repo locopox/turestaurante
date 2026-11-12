@@ -5,6 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#1C4D35" />
     <title>TuRestaurante</title>
+    <script>
+      // Enlaces de los códigos QR: /r/<slug> y /r/<slug>/mesa/<n>. La app solo entiende direcciones con
+      // «#» (#pedir-<slug>-mesa-<n>) y se compila con rutas relativas (base: './'), así que en /r/… no
+      // encontraría sus archivos. Este script se ejecuta ANTES de cargar la app y cambia la dirección
+      // por la equivalente con «#», en el mismo sitio y en la misma carpeta. Solo acepta direcciones
+      // web de restaurante válidas y mesas de 1 a 999; con cualquier otra dirección no hace nada.
+      // La carpeta anterior a /r/ solo admite tramos con nombre («//» no): así el destino nunca puede
+      // ser «//otro-sitio…» y la redirección no sale nunca de este sitio.
+      // Se prueba en src/__tests__/qrRedirect.test.ts y e2e/qr-links.e2e.ts.
+      (function () {
+        var m = location.pathname.match(/^((?:\/[A-Za-z0-9._~%-]+)*?)\/r\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\/mesa\/([1-9][0-9]{0,2}))?\/?$/);
+        if (m) location.replace(m[1] + '/' + location.search + '#pedir-' + m[2] + (m[3] ? '-mesa-' + m[3] : ''));
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@500;600&display=swap" />

@@ -1,3 +1,5 @@
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { defineConfig, devices } from '@playwright/test';
 
 /**
@@ -8,9 +10,16 @@ import { defineConfig, devices } from '@playwright/test';
  *    Nunca contra un proyecto remoto: se comprueba que la URL sea local.
  * La app de «supabase-local» se sirve en http://127.0.0.1:5173: debe coincidir con APP_URL de la función
  * «invitations» y con las Redirect URLs de Supabase Auth.
+ *  - «qr» y «qr-build»: enlaces de los códigos QR (/r/<slug>/mesa/<n>) en modo demo. «qr» usa el servidor
+ *    de desarrollo; «qr-build» compila la app en una carpeta TEMPORAL del sistema (nunca dist/) y la sirve
+ *    con `vite preview`. `npm run test:e2e:qr`
  */
 const local = (u?: string) => !!u && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\/?$/.test(u);
 const wantsLocal = process.argv.some((a) => a.includes('supabase-local'));
+// La compilación de prueba solo se hace si se piden las pruebas de la app compilada (o todas).
+const projectArgs = process.argv.filter((a) => a.startsWith('--project'));
+const wantsBuild = projectArgs.length === 0 || process.argv.some((a) => a.includes('qr-build'));
+const qrBuildDir = join(tmpdir(), 'turestaurante-qr-build');
 if (wantsLocal && !local(process.env.API_URL)) {
   throw new Error('API_URL debe ser un Supabase LOCAL (eval "$(supabase status -o env)"). Nunca un proyecto remoto.');
 }
@@ -27,6 +36,8 @@ export default defineConfig({
   projects: [
     { name: 'demo', testMatch: 'demo.e2e.ts', use: { baseURL: 'http://127.0.0.1:5174/' } },
     { name: 'supabase-local', testMatch: 'invitations.local.e2e.ts', use: { baseURL: 'http://127.0.0.1:5173/' } },
+    { name: 'qr', testMatch: 'qr-links.e2e.ts', use: { baseURL: 'http://127.0.0.1:5174/' } },
+    { name: 'qr-build', testMatch: 'qr-links.e2e.ts', use: { baseURL: 'http://127.0.0.1:5175/' } },
   ],
   webServer: [
     {
@@ -35,6 +46,13 @@ export default defineConfig({
       env: { VITE_DATA_BACKEND: 'mock' },
       reuseExistingServer: false,
     },
+    ...(wantsBuild ? [{
+      command: `npx vite build --outDir "${qrBuildDir}" --emptyOutDir && npx vite preview --outDir "${qrBuildDir}" --host 127.0.0.1 --port 5175 --strictPort`,
+      url: 'http://127.0.0.1:5175/',
+      env: { VITE_DATA_BACKEND: 'mock' },
+      timeout: 180_000,
+      reuseExistingServer: false,
+    }] : []),
     ...(wantsLocal ? [{
       command: 'npx vite --host 127.0.0.1 --port 5173 --strictPort',
       url: 'http://127.0.0.1:5173/',
