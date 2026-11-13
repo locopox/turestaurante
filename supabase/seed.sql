@@ -2,14 +2,27 @@
 -- Ejecutar DESPUÉS de schema.sql. Se puede ejecutar varias veces: usa identificadores fijos
 -- y «on conflict do nothing», así que no duplica nada ni sobrescribe cambios hechos después.
 -- El pago online queda DESACTIVADO: no hay integración real con un proveedor de pagos.
+-- Modalidad comercial: solo si esta ejecución CREA La Piazza, queda «activa» (datos de demostración).
 
 begin;
 
-insert into public.restaurants (id, slug, name, tagline, address, phone, active, tables,
-  pickup_enabled, online_payment_enabled, counter_payment_enabled, prep_minutes)
-values ('5e5e0000-0000-4000-8000-000000000001', 'la-piazza', 'La Piazza', 'Pizzería y trattoria · horno de leña',
-  'Calle Mayor 12, Madrid', '910 000 000', true, 12, true, false, true, 18)
-on conflict (id) do nothing;
+-- Si ESTA ejecución crea La Piazza (instalación nueva de demostración o de pruebas), su cuenta comercial
+-- pasa de «borrador» a «activa» para que la demo pueda recibir pedidos. Si La Piazza ya existía (por
+-- ejemplo, un restaurante real con este identificador), NO se toca nada: ni el restaurante ni su
+-- modalidad comercial. Ningún otro restaurante se activa.
+do $$
+begin
+  insert into public.restaurants (id, slug, name, tagline, address, phone, active, tables,
+    pickup_enabled, online_payment_enabled, counter_payment_enabled, prep_minutes)
+  values ('5e5e0000-0000-4000-8000-000000000001', 'la-piazza', 'La Piazza', 'Pizzería y trattoria · horno de leña',
+    'Calle Mayor 12, Madrid', '910 000 000', true, 12, true, false, true, 18)
+  on conflict (id) do nothing;
+  if found and to_regclass('private.tenant_accounts') is not null then
+    perform set_config('turestaurante.motivo', 'Datos de demostración (seed.sql)', true);
+    update private.tenant_accounts set status = 'activa'
+    where restaurant_id = '5e5e0000-0000-4000-8000-000000000001' and status = 'borrador';
+  end if;
+end $$;
 
 insert into public.categories (id, restaurant_id, name, sort) values
   ('5e5e0000-0000-4000-8000-000000000101', '5e5e0000-0000-4000-8000-000000000001', 'Entrantes', 1),

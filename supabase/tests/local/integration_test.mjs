@@ -142,6 +142,11 @@ const prodA = sql(`with c as (insert into public.categories (restaurant_id, name
 const prodB = sql(`with c as (insert into public.categories (restaurant_id, name) values ('${RB}', 'Platos') returning id)
   insert into public.products (restaurant_id, category_id, name, price_cents) select '${RB}', id, 'Plato B', 800 from c returning id`);
 sql(`update public.restaurants set active = true where id = '${RB}'`);
+// Todo restaurante nuevo empieza en «borrador» (sin pedidos): a estos dos, de prueba, se les asigna «activa»
+// (solo si la base de datos ya tiene el sistema comercial).
+sql(`do $$ begin if to_regclass('private.tenant_accounts') is not null then
+  update private.tenant_accounts set status = 'activa' where restaurant_id in ('${RA}', '${RB}') and status = 'borrador';
+end if; end $$`);
 for (const [r, p] of [[RA, prodA], [RB, prodB]]) {
   await rpc(null, 'create_order', { payload: { restaurantId: r, mode: 'mesa', table: 1, paymentMethod: 'caja', accessToken: randomBytes(32).toString('hex'), items: [{ productId: p, quantity: 1 }] } });
 }

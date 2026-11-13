@@ -31,3 +31,8 @@ psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists ${DB}_limites
 psql -v ON_ERROR_STOP=1 -q -d ${DB}_limites -f tests/supabase_shim.sql -f schema.sql -f seed.sql
 bash tests/order_limits_concurrency_test.sh ${DB}_limites
 psql -q -d postgres -c "drop database ${DB}_limites"
+# Protección comercial de los pedidos con peticiones simultáneas, en otra base desechable
+psql -v ON_ERROR_STOP=1 -q -d postgres -c "drop database if exists ${DB}_comercial" -c "create database ${DB}_comercial"
+psql -v ON_ERROR_STOP=1 -q -d ${DB}_comercial -f tests/supabase_shim.sql -f schema.sql -f seed.sql
+bash tests/commercial_concurrency_test.sh ${DB}_comercial
+psql -q -d postgres -c "drop database ${DB}_comercial"

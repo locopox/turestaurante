@@ -516,8 +516,17 @@ try {
       (:'pa1', :'ra', :'ca', 'Producto A1 de prueba', :'price_a1'),
       (:'pa2', :'ra', :'ca', 'Producto A2 de prueba', :'price_a2'),
       (:'pb1', :'rb', :'cb', 'Producto B1 de prueba', :'price_b1');
+    -- Todo restaurante nuevo empieza en «borrador» (sin pedidos): a ESTOS dos, de prueba, se les asigna «activa»
+    -- (solo si la base de datos ya tiene el sistema comercial). No toca ningún otro restaurante.
+    select set_config('tr.rids', :'rids', true);
+    do $$ begin
+      if to_regclass('private.tenant_accounts') is not null then
+        update private.tenant_accounts set status = 'activa'
+        where restaurant_id = any (current_setting('tr.rids')::uuid[]) and status = 'borrador';
+      end if;
+    end $$;
     commit;`, {
-    ra: RA, rb: RB, slug_a: `prueba-pedidos-a-${RUN}`, slug_b: `prueba-pedidos-b-${RUN}`, name_a: names.a, name_b: names.b,
+    rids: pgArray([RA, RB]), ra: RA, rb: RB, slug_a: `prueba-pedidos-a-${RUN}`, slug_b: `prueba-pedidos-b-${RUN}`, name_a: names.a, name_b: names.b,
     ca: CA, cb: CB, pa1: P.a1, pa2: P.a2, pb1: P.b1, price_a1: PRICE.a1, price_a2: PRICE.a2, price_b1: PRICE.b1,
   });
   console.log(`Restaurantes «${names.a}» y «${names.b}» con su carta`);

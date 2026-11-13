@@ -75,6 +75,8 @@ values (tests.otro(), 'otro-sitio', 'Otro Sitio', true, 4, true, true, true);
 insert into public.categories (id, restaurant_id, name) values ('b0000000-0000-4000-8000-000000000101', tests.otro(), 'Platos');
 insert into public.products (id, restaurant_id, category_id, name, price_cents)
 values (tests.otro_prod(), tests.otro(), 'b0000000-0000-4000-8000-000000000101', 'Plato del día', 900);
+-- Los restaurantes nuevos empiezan en «borrador» (sin pedidos): a este se le asigna expresamente «activa».
+update private.tenant_accounts set status = 'activa' where restaurant_id = tests.otro() and status = 'borrador';
 
 insert into auth.users (id, email) values
   ('a0000000-0000-4000-8000-0000000000a1', 'owner@piazza.test'),
@@ -1795,6 +1797,7 @@ insert into public.categories (id, restaurant_id, name) values
 insert into public.products (id, restaurant_id, category_id, name, price_cents) values
   (tests.l1_prod(), tests.l1(), 'f0000000-0000-4000-8000-000000000101', 'Menú', 500),
   (tests.l2_prod(), tests.l2(), 'f0000000-0000-4000-8000-000000000102', 'Menú', 700);
+update private.tenant_accounts set status = 'activa' where restaurant_id in (tests.l1(), tests.l2()) and status = 'borrador';
 insert into auth.users (id, email) values (tests.u('f1'), 'owner@limites.test'), (tests.u('f2'), 'manager@limites.test'),
   (tests.u('f3'), 'sala@limites.test'), (tests.u('f4'), 'cocina@limites.test'), (tests.u('f5'), 'owner@limites-dos.test');
 insert into public.restaurant_staff (restaurant_id, user_id, role) values
@@ -2070,9 +2073,12 @@ begin execute q; return 'ok'; exception when others then return sqlerrm; end $$;
 select tests.ok((select count(*) from public.restaurants) = (select count(*) from private.tenant_accounts)
   and not exists (select 1 from public.restaurants r where not exists (select 1 from private.tenant_accounts a where a.restaurant_id = r.id)),
   'cuenta comercial: una por restaurante, ninguno sin cuenta');
-select tests.ok((tests.acc(tests.piazza())).status = 'borrador' and (tests.acc(tests.piazza())).origin = 'alta'
+select tests.ok((tests.acc(tests.piazza())).status = 'activa' and (tests.acc(tests.piazza())).origin = 'alta'
   and (tests.acc(tests.piazza())).plan_code is null and (tests.acc(tests.piazza())).trial_started_at is null,
-  'restaurante creado después del sistema comercial (seed, instalación nueva): borrador, sin plan ni prueba');
+  'La Piazza de ejemplo (creada por seed.sql en una instalación nueva): activa, sin plan ni prueba');
+select tests.ok(exists (select 1 from private.audit_log where action = 'comercial.cambio' and restaurant_id = tests.piazza()
+  and details -> 'antes' ->> 'estado' = 'borrador' and details -> 'despues' ->> 'estado' = 'activa'
+  and details ->> 'motivo' = 'Datos de demostración (seed.sql)'), 'La Piazza de ejemplo: su activación queda auditada con su motivo');
 select tests.ok(not exists (select 1 from private.tenant_accounts where status = 'sin_asignar' and origin <> 'existente'),
   'nadie tiene «sin_asignar» salvo los restaurantes que ya existían');
 
@@ -2212,10 +2218,11 @@ insert into public.restaurant_staff (restaurant_id, user_id, role) values
 select tests.claims('authenticated', tests.u('a1'));
 set role authenticated;
 insert into tests.vars select 'c_st_piazza', public.restaurant_commercial_status(tests.piazza());
-select tests.ok(tests.v('c_st_piazza') ->> 'status' = 'borrador' and tests.v('c_st_piazza') ->> 'restaurantId' = tests.piazza()::text,
+select tests.ok(tests.v('c_st_piazza') ->> 'status' = 'activa' and tests.v('c_st_piazza') ->> 'restaurantId' = tests.piazza()::text
+  and tests.v('c_st_piazza') ->> 'acceptsOrders' = 'true',
   'owner: consulta el estado comercial de su restaurante');
 select tests.ok((select array_agg(k order by k) from jsonb_object_keys(tests.v('c_st_piazza')) k)
-  = array['plan', 'planName', 'restaurantId', 'serverNow', 'status', 'trialEndsAt', 'trialSecondsLeft', 'trialStartedAt'],
+  = array['acceptsOrders', 'plan', 'planName', 'restaurantId', 'serverNow', 'status', 'trialEndsAt', 'trialSecondsLeft', 'trialStartedAt'],
   'la consulta solo devuelve el estado, el plan y las fechas (sin quién lo cambió ni datos internos)', tests.v('c_st_piazza')::text);
 select tests.claims('authenticated', tests.u('e1'));
 insert into tests.vars select 'c_st_c1', public.restaurant_commercial_status(tests.c1());
@@ -2259,25 +2266,294 @@ select tests.ok(public.restaurant_commercial_status(tests.c1()) ->> 'status' = '
 select tests.throws(format('select public.restaurant_commercial_status(%L)', gen_random_uuid()), 'no encontrado', 'plataforma: restaurante inexistente');
 reset role;
 
--- 17.7 En esta etapa el estado comercial NO bloquea nada: los pedidos funcionan igual que antes
+-- 17.7 Un restaurante «vencido» ya NO acepta pedidos nuevos (protección comercial, sección 18)
 update public.restaurants set active = true where id = tests.c1();
 insert into public.categories (id, restaurant_id, name) values ('c7000000-0000-4000-8000-000000000101', tests.c1(), 'Carta');
 insert into public.products (id, restaurant_id, category_id, name, price_cents)
 values ('c7000000-0000-4000-8000-000000000201', tests.c1(), 'c7000000-0000-4000-8000-000000000101', 'Menú', 800);
 select tests.claims('anon', null);
 set role anon;
-insert into tests.vars select 'c_pedido', public.create_order(jsonb_build_object('restaurantId', tests.c1(), 'mode', 'mesa', 'table', 1,
+select tests.throws(format('select public.create_order(%L)', jsonb_build_object('restaurantId', tests.c1(), 'mode', 'mesa', 'table', 1,
   'paymentMethod', 'caja', 'accessToken', tests.tok(77001),
-  'items', jsonb_build_array(jsonb_build_object('productId', 'c7000000-0000-4000-8000-000000000201', 'quantity', 1))));
-select tests.ok(tests.v('c_pedido') ? 'id' and tests.v('c_pedido') ->> 'total' = '800',
-  'sin bloqueos todavía: un restaurante «vencido» sigue aceptando pedidos como antes');
+  'items', jsonb_build_array(jsonb_build_object('productId', 'c7000000-0000-4000-8000-000000000201', 'quantity', 1)))),
+  '^El restaurante no acepta pedidos en este momento$', 'restaurante «vencido»: no acepta pedidos nuevos');
 reset role;
+select tests.ok(not exists (select 1 from public.orders where restaurant_id = tests.c1()), 'restaurante «vencido»: el pedido rechazado no se guarda');
 
 -- 17.8 Borrar un restaurante (sin pedidos) borra su cuenta comercial
 select tests.claims(null, null);
 select tests.ok(tests.try($$delete from public.restaurants where slug = 'comercial-api'$$) = 'ok'
   and not exists (select 1 from private.tenant_accounts a where not exists (select 1 from public.restaurants r where r.id = a.restaurant_id)),
   'borrar un restaurante borra su cuenta comercial (en cascada)');
+
+-- ===================== 18. PROTECCIÓN COMERCIAL DE LOS PEDIDOS =====================
+reset role;
+select tests.claims(null, null);
+-- Restaurante K1 (con carta, abierto, pago online activado) y su equipo; límites altos para no mezclar
+-- esta sección con los límites contra pedidos masivos (que se comprueban aparte, en 18.6).
+create function tests.k1() returns uuid language sql immutable as $$ select 'c8000000-0000-4000-8000-000000000001'::uuid $$;
+create function tests.k1_prod() returns uuid language sql immutable as $$ select 'c8000000-0000-4000-8000-000000000201'::uuid $$;
+-- Intenta un pedido (con el rol actual) y devuelve 'ok', 'limite:<motivo>' o el mensaje de error.
+create function tests.order_try(rid uuid, prod uuid, token int, method text default 'caja') returns text language plpgsql as $$
+declare j jsonb;
+begin
+  j := public.create_order(jsonb_build_object('restaurantId', rid, 'mode', 'mesa', 'table', 1 + token % 10,
+    'paymentMethod', method, 'accessToken', tests.tok(token),
+    'items', jsonb_build_array(jsonb_build_object('productId', prod, 'quantity', 1))));
+  return case when j ? 'id' then 'ok' when j ? 'rejected' then 'limite:' || (j ->> 'reason') else 'respuesta inesperada' end;
+exception when others then
+  return sqlerrm;
+end $$;
+create function tests.k1_orders() returns int language sql stable as $$ select count(*)::int from public.orders where restaurant_id = tests.k1() $$;
+create function tests.k1_set(st text) returns text language plpgsql as $$
+begin  -- como plataforma, con su función (cada llamada en su propia transacción de la prueba)
+  perform set_config('request.jwt.claims', json_build_object('role', 'authenticated', 'sub', tests.u('ad'))::text, true);
+  perform public.platform_set_commercial_status(tests.k1(), st, 'Prueba automática');
+  return 'ok';
+exception when others then
+  return sqlerrm;
+end $$;
+
+insert into public.restaurants (id, slug, name, active, tables, pickup_enabled, online_payment_enabled, counter_payment_enabled)
+values (tests.k1(), 'proteccion-uno', 'Protección Uno', true, 10, true, true, true);
+insert into public.categories (id, restaurant_id, name) values ('c8000000-0000-4000-8000-000000000101', tests.k1(), 'Carta');
+insert into public.products (id, restaurant_id, category_id, name, price_cents)
+values (tests.k1_prod(), tests.k1(), 'c8000000-0000-4000-8000-000000000101', 'Menú', 600);
+insert into private.order_limits (restaurant_id, per_table, pickup, per_restaurant, online_pending, window_minutes)
+values (tests.k1(), 500, 500, 1000, 1000, 30);
+insert into auth.users (id, email) values (tests.u('0a'), 'owner@proteccion.test'), (tests.u('0b'), 'sala@proteccion.test'),
+  (tests.u('0c'), 'cocina@proteccion.test');
+insert into public.restaurant_staff (restaurant_id, user_id, role) values
+  (tests.k1(), tests.u('0a'), 'owner'), (tests.k1(), tests.u('0b'), 'waiter'), (tests.k1(), tests.u('0c'), 'kitchen');
+
+-- 18.1 La regla, en cada estado y en el instante exacto del fin de la prueba
+select tests.ok(private.commercial_allows_orders('sin_asignar', null, now()) and private.commercial_allows_orders('activa', null, now())
+  and not private.commercial_allows_orders('borrador', null, now()) and not private.commercial_allows_orders('vencida', null, now())
+  and not private.commercial_allows_orders('inventado', null, now()) and not private.commercial_allows_orders(null, null, now()),
+  'regla: sin_asignar y activa sí; borrador, vencida y estados desconocidos no');
+select tests.ok(private.commercial_allows_orders('prueba', timestamptz '2026-12-01 10:00:00+00', timestamptz '2026-12-01 09:59:59.999999+00')
+  and not private.commercial_allows_orders('prueba', timestamptz '2026-12-01 10:00:00+00', timestamptz '2026-12-01 10:00:00+00')
+  and not private.commercial_allows_orders('prueba', timestamptz '2026-12-01 10:00:00+00', timestamptz '2026-12-01 10:00:00.000001+00')
+  and not private.commercial_allows_orders('prueba', null, now()),
+  'regla: la prueba acepta hasta un microsegundo antes de su fin, y ya no en el instante del fin');
+
+-- 18.2 Cada estado con pedidos reales (cliente anónimo, por create_order)
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80001) = 'El restaurante no acepta pedidos en este momento',
+  'borrador: rechaza el pedido nuevo con el mensaje de restaurante cerrado', tests.order_try(tests.k1(), tests.k1_prod(), 80001));
+reset role;
+select tests.ok(tests.k1_orders() = 0 and not exists (select 1 from private.order_counters where restaurant_id = tests.k1())
+  and not exists (select 1 from private.order_access a where a.token_hash = private.token_hash(tests.tok(80001))),
+  'borrador: el pedido rechazado no se guarda, no gasta número ni guarda su código');
+select tests.ok(tests.k1_set('prueba') = 'ok', 'plataforma: empieza la prueba (desde borrador)');
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80002) = 'ok' and tests.order_try(tests.k1(), tests.k1_prod(), 80003) = 'ok'
+  and tests.order_try(tests.k1(), tests.k1_prod(), 80004, 'online') = 'ok' and tests.order_try(tests.k1(), tests.k1_prod(), 80005) = 'ok',
+  'prueba en curso: acepta pedidos');
+reset role;
+select tests.ok(tests.k1_orders() = 4, 'prueba en curso: 4 pedidos guardados');
+insert into tests.vars select 'k_o2', jsonb_build_object('id', o.id) from public.orders o join private.order_access a on a.order_id = o.id
+  where a.token_hash = private.token_hash(tests.tok(80002));
+insert into tests.vars select 'k_o3', jsonb_build_object('id', o.id) from public.orders o join private.order_access a on a.order_id = o.id
+  where a.token_hash = private.token_hash(tests.tok(80003));
+insert into tests.vars select 'k_o4', jsonb_build_object('id', o.id) from public.orders o join private.order_access a on a.order_id = o.id
+  where a.token_hash = private.token_hash(tests.tok(80004));
+insert into tests.vars select 'k_o5', jsonb_build_object('id', o.id) from public.orders o join private.order_access a on a.order_id = o.id
+  where a.token_hash = private.token_hash(tests.tok(80005));
+-- La prueba termina dentro de 2 segundos (solo en esta base desechable: se desactiva un momento el
+-- vigilante de la cuenta para simular que la prueba empezó hace casi 14 días).
+alter table private.tenant_accounts disable trigger tenant_accounts_guard;
+update private.tenant_accounts set trial_ends_at = clock_timestamp() + interval '2 seconds',
+  trial_started_at = clock_timestamp() + interval '2 seconds' - interval '14 days' where restaurant_id = tests.k1();
+alter table private.tenant_accounts enable trigger tenant_accounts_guard;
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80006) = 'ok', 'prueba a punto de terminar: todavía acepta');
+reset role;
+select pg_sleep(2.2);
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80007) = 'El restaurante no acepta pedidos en este momento',
+  'prueba terminada (aunque su estado siga siendo «prueba»): rechaza pedidos nuevos al instante');
+-- Reintentos: el de un pedido ya creado devuelve ESE pedido; el de un intento rechazado sigue rechazado.
+insert into tests.vars select 'k_retry', public.create_order(jsonb_build_object('restaurantId', tests.k1(), 'mode', 'mesa', 'table', 1 + 80002 % 10,
+  'paymentMethod', 'caja', 'accessToken', tests.tok(80002), 'items', jsonb_build_array(jsonb_build_object('productId', tests.k1_prod(), 'quantity', 1))));
+select tests.ok(tests.id('k_retry') = tests.id('k_o2'), 'tras el fin de la prueba: el reintento de un pedido ya creado devuelve ese pedido');
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80007) = 'El restaurante no acepta pedidos en este momento',
+  'tras el fin de la prueba: el reintento de un pedido rechazado sigue rechazado');
+reset role;
+select tests.ok(tests.k1_orders() = 5, 'reintentos: ningún pedido duplicado ni nuevo (5)');
+-- Los pedidos anteriores se siguen gestionando: cocina, sala, cobro, cancelación y pasar a caja.
+select tests.claims('authenticated', tests.u('0c'));
+set role authenticated;
+select tests.ok(tests.in_kitchen(tests.k1(), tests.id('k_o2')), 'tras el fin de la prueba: cocina sigue viendo los pedidos anteriores');
+select tests.ok(tests.try(format($$select public.staff_set_prep_status(%L, 'en_preparacion')$$, tests.id('k_o2'))) = 'ok',
+  'tras el fin de la prueba: cocina sigue preparando pedidos anteriores');
+select tests.claims('authenticated', tests.u('0b'));
+select tests.ok(tests.try(format($$select public.staff_set_prep_status(%L, 'listo')$$, tests.id('k_o2'))) = 'ok'
+  and tests.try(format($$select public.staff_set_prep_status(%L, 'entregado')$$, tests.id('k_o2'))) = 'ok',
+  'tras el fin de la prueba: sala sigue entregando pedidos anteriores');
+select tests.ok(tests.try(format($$select public.staff_mark_paid_at_counter(%L)$$, tests.id('k_o2'))) = 'ok',
+  'tras el fin de la prueba: sala sigue cobrando pedidos anteriores');
+select tests.ok(tests.try(format($$select public.staff_set_prep_status(%L, 'cancelado')$$, tests.id('k_o3'))) = 'ok',
+  'tras el fin de la prueba: sala sigue cancelando pedidos anteriores');
+select tests.ok((select count(*) from public.orders where restaurant_id = tests.k1()) = 5, 'sala: ve los pedidos anteriores de su restaurante');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+insert into tests.vars select 'k_sw', public.customer_switch_to_counter(tests.id('k_o4'), tests.tok(80004));
+select tests.ok(tests.v('k_sw') ->> 'paymentStatus' = 'pendiente_caja', 'tras el fin de la prueba: un pedido anterior se puede pasar a caja');
+select tests.ok(public.get_customer_order(tests.id('k_o5'), tests.tok(80005)) ->> 'id' = tests.id('k_o5')::text,
+  'tras el fin de la prueba: el cliente sigue viendo su pedido anterior');
+reset role;
+select tests.ok((select payment_status = 'cobrado_caja' and prep_status = 'entregado' from public.orders where id = tests.id('k_o2'))
+  and (select prep_status = 'cancelado' from public.orders where id = tests.id('k_o3')) and tests.k1_orders() = 5,
+  'tras el fin de la prueba: los pedidos anteriores conservan sus cambios y no aparece ninguno nuevo');
+-- vencida (la plataforma la marca) → rechaza; activa → acepta de nuevo
+select tests.ok(tests.k1_set('vencida') = 'ok', 'plataforma: marca la prueba como vencida');
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80008) = 'El restaurante no acepta pedidos en este momento', 'vencida: rechaza pedidos nuevos');
+reset role;
+select tests.ok(tests.k1_set('activa') = 'ok', 'plataforma: activa una modalidad (sin caducidad automática)');
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try(tests.k1(), tests.k1_prod(), 80009) = 'ok', 'activa: acepta pedidos nuevos');
+reset role;
+-- Restaurantes que ya existían («sin_asignar»): siguen aceptando pedidos
+select tests.claims(null, null);
+alter table public.restaurants disable trigger restaurants_tenant_account;
+insert into public.restaurants (id, slug, name, active, tables) values ('c8000000-0000-4000-8000-000000000002', 'proteccion-antiguo', 'Protección Antiguo', true, 5);
+alter table public.restaurants enable trigger restaurants_tenant_account;
+insert into private.tenant_accounts (restaurant_id, status, origin)
+select r.id, 'sin_asignar', 'existente' from public.restaurants r
+where not exists (select 1 from private.tenant_accounts a where a.restaurant_id = r.id) on conflict (restaurant_id) do nothing;
+insert into public.categories (id, restaurant_id, name) values ('c8000000-0000-4000-8000-000000000102', 'c8000000-0000-4000-8000-000000000002', 'Carta');
+insert into public.products (id, restaurant_id, category_id, name, price_cents)
+values ('c8000000-0000-4000-8000-000000000202', 'c8000000-0000-4000-8000-000000000002', 'c8000000-0000-4000-8000-000000000102', 'Menú', 700);
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try('c8000000-0000-4000-8000-000000000002', 'c8000000-0000-4000-8000-000000000202', 80010) = 'ok',
+  'restaurante que ya existía (sin_asignar): sigue aceptando pedidos como siempre');
+reset role;
+-- Sin cuenta comercial: rechaza (solo en esta base desechable se crea un restaurante sin ella)
+select tests.claims(null, null);
+alter table public.restaurants disable trigger restaurants_tenant_account;
+insert into public.restaurants (id, slug, name, active, tables) values ('c8000000-0000-4000-8000-000000000003', 'proteccion-sin-cuenta', 'Sin cuenta', true, 5);
+alter table public.restaurants enable trigger restaurants_tenant_account;
+insert into public.categories (id, restaurant_id, name) values ('c8000000-0000-4000-8000-000000000103', 'c8000000-0000-4000-8000-000000000003', 'Carta');
+insert into public.products (id, restaurant_id, category_id, name, price_cents)
+values ('c8000000-0000-4000-8000-000000000203', 'c8000000-0000-4000-8000-000000000003', 'c8000000-0000-4000-8000-000000000103', 'Menú', 700);
+set role anon;
+select tests.claims('anon', null);
+select tests.ok(tests.order_try('c8000000-0000-4000-8000-000000000003', 'c8000000-0000-4000-8000-000000000203', 80011) = 'El restaurante no acepta pedidos en este momento',
+  'sin cuenta comercial: rechaza pedidos nuevos');
+reset role;
+
+-- 18.3 No se puede saltar: ni desde la API ni con permisos elevados
+select tests.claims(null, null);
+select tests.ok(tests.try(format($$insert into public.orders (restaurant_id, number, mode, table_number, total_cents, payment_method, payment_status)
+  values (%L, 1, 'mesa', 1, 100, 'caja', 'pendiente_caja')$$, tests.c1())) = 'El restaurante no acepta pedidos en este momento',
+  'SQL Editor (acceso completo): tampoco puede insertar un pedido en un restaurante vencido');
+set role service_role;
+select tests.claims('service_role', null);
+select tests.throws(format($$insert into public.orders (restaurant_id, number, mode, table_number, total_cents, payment_method, payment_status)
+  values (%L, 1, 'mesa', 1, 100, 'caja', 'pendiente_caja')$$, tests.c1()), 'permission denied', 'servidor: no puede insertar pedidos directamente');
+select tests.throws(format('select private.tenant_order_authorized(%L)', tests.k1()), 'permission denied', 'servidor: no puede usar la comprobación interna');
+reset role;
+set role anon;
+select tests.claims('anon', null);
+select tests.throws(format('select private.tenant_order_authorized(%L)', tests.k1()), 'permission denied', 'anónimo: no puede usar la comprobación interna');
+select tests.throws($$select private.commercial_allows_orders('activa', null, now())$$, 'permission denied', 'anónimo: no puede usar la regla interna');
+-- El navegador no puede «convencer» al servidor con campos inventados
+select tests.ok(tests.try(format('select public.create_order(%L)', jsonb_build_object('restaurantId', tests.c1(), 'mode', 'mesa', 'table', 1,
+  'paymentMethod', 'caja', 'accessToken', tests.tok(80012), 'status', 'activa', 'commercialStatus', 'activa', 'trialEndsAt', '2099-01-01',
+  'items', jsonb_build_array(jsonb_build_object('productId', 'c7000000-0000-4000-8000-000000000201', 'quantity', 1))))) = 'El restaurante no acepta pedidos en este momento',
+  'anónimo: enviar «activa» o fechas inventadas no sirve de nada');
+reset role;
+select tests.ok(exists (select 1 from pg_trigger where tgname = 'orders_commercial_guard' and tgrelid = 'public.orders'::regclass and tgenabled = 'O'),
+  'el trigger de protección comercial está activo en la tabla de pedidos');
+
+-- 18.4 platform_set_commercial_status: solo la plataforma, con motivo, auditado y dentro de las reglas
+set role anon;
+select tests.claims('anon', null);
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'activa', 'motivo')$$, tests.k1()), 'permission denied', 'anónimo: no puede cambiar la modalidad');
+reset role;
+set role service_role;
+select tests.claims('service_role', null);
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'activa', 'motivo')$$, tests.k1()), 'permission denied', 'servidor: no puede cambiar la modalidad');
+reset role;
+set role authenticated;
+select tests.claims('authenticated', tests.u(c)), tests.throws(format($$select public.platform_set_commercial_status(%L, 'vencida', 'motivo')$$, tests.k1()),
+  'Solo la plataforma', format('%s: no puede cambiar la modalidad', who))
+from (values ('0a', 'owner del restaurante'), ('0b', 'sala'), ('0c', 'cocina'), ('a1', 'owner de otro restaurante'), ('ee', 'sin rol')) v(c, who);
+select tests.claims('authenticated', tests.u('0a'));
+select tests.throws(format($$select public.platform_set_commercial_status(%L, null, 'motivo', 30)$$, tests.k1()), 'Solo la plataforma', 'owner: no puede ampliar su prueba');
+select tests.claims('authenticated', tests.u('ad'));
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'sin_asignar', 'motivo')$$, tests.k1()), 'No se puede asignar', 'plataforma: no puede asignar «sin_asignar»');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'borrador', 'motivo')$$, tests.k1()), 'No se puede asignar', 'plataforma: no puede volver a «borrador»');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'gratis', 'motivo')$$, tests.k1()), 'no válida', 'plataforma: modalidad inventada rechazada');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'activa', 'motivo')$$, tests.k1()), 'ya tiene esa modalidad', 'plataforma: sin cambios inútiles');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'vencida', '  ')$$, tests.k1()), 'motivo', 'plataforma: el motivo es obligatorio');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'vencida', 'motivo')$$, gen_random_uuid()), 'no encontrado', 'plataforma: restaurante inexistente');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'prueba', 'motivo')$$, tests.k1()), 'no permitido|solo puede empezar', 'plataforma: no hay segunda prueba gratuita');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, 'prueba', 'motivo')$$, 'c8000000-0000-4000-8000-000000000002'),
+  'no permitido|solo puede empezar', 'plataforma: un restaurante que ya existía no recibe una prueba retroactiva');
+select tests.throws(format($$select public.platform_set_commercial_status(%L, null, 'motivo', 5)$$, tests.k1()), 'prueba en curso', 'plataforma: solo amplía pruebas en curso');
+reset role;
+-- Ampliaciones de una prueba en curso
+insert into public.restaurants (id, slug, name) values ('c8000000-0000-4000-8000-000000000004', 'proteccion-ampliar', 'Ampliar');
+set role authenticated;
+select tests.claims('authenticated', tests.u('ad'));
+select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', 'prueba', 'Prueba para ampliar');
+select tests.ok(public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', null, 'Le falta configurar la carta', 7) ->> 'trialEndsAt' is not null,
+  'plataforma: amplía una prueba en curso');
+select tests.throws($$select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', null, 'motivo', 0)$$, 'de 1 a 30', 'plataforma: ampliación de 0 días rechazada');
+select tests.throws($$select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', null, 'motivo', 31)$$, 'de 1 a 30', 'plataforma: ampliación de más de 30 días rechazada');
+select tests.ok(tests.try($$select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', null, 'motivo', 30)$$) = 'ok'
+  and tests.try($$select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', null, 'motivo', 10)$$) ~ '60 días',
+  'plataforma: una prueba no puede durar más de 60 días en total');
+select tests.throws($$select public.platform_set_commercial_status('c8000000-0000-4000-8000-000000000004', 'activa', 'motivo', 5)$$, 'a la vez', 'plataforma: no amplía y cambia de modalidad a la vez');
+reset role;
+select tests.ok((select a.trial_ends_at = a.trial_started_at + interval '51 days' from private.tenant_accounts a where a.restaurant_id = 'c8000000-0000-4000-8000-000000000004'),
+  'ampliaciones: 14 + 7 + 30 = 51 días; las rechazadas no cambian nada');
+select tests.ok(exists (select 1 from private.audit_log where action = 'comercial.cambio' and restaurant_id = 'c8000000-0000-4000-8000-000000000004'
+    and details ->> 'motivo' = 'Le falta configurar la carta' and actor_user_id = tests.u('ad') and actor_kind = 'plataforma')
+  and exists (select 1 from private.audit_log where action = 'comercial.cambio' and restaurant_id = tests.k1()
+    and details -> 'antes' ->> 'estado' = 'vencida' and details -> 'despues' ->> 'estado' = 'activa' and details ->> 'motivo' = 'Prueba automática'),
+  'auditoría: cada cambio de la plataforma queda registrado con quién, antes, después y motivo');
+-- Un restaurante nuevo empieza en «borrador» y no recibe pedidos hasta que la plataforma le asigna una modalidad
+select tests.claims(null, null);
+insert into public.restaurants (id, slug, name, active, tables) values ('c8000000-0000-4000-8000-000000000005', 'proteccion-nuevo', 'Nuevo', true, 5);
+select tests.ok((tests.acc('c8000000-0000-4000-8000-000000000005')).status = 'borrador'
+  and not private.tenant_order_authorized('c8000000-0000-4000-8000-000000000005'), 'restaurante nuevo: borrador, sin pedidos');
+
+-- 18.5 El estado comercial que ven owner y plataforma dice si acepta pedidos (sin el porqué)
+select tests.claims('authenticated', tests.u('0a'));
+set role authenticated;
+select tests.ok(public.restaurant_commercial_status(tests.k1()) ->> 'acceptsOrders' = 'true', 'owner: ve que su restaurante acepta pedidos');
+reset role;
+select tests.ok(tests.k1_set('vencida') = 'ok', 'plataforma: vuelve a marcarlo vencido');
+select tests.claims('authenticated', tests.u('0a'));
+set role authenticated;
+select tests.ok(public.restaurant_commercial_status(tests.k1()) ->> 'acceptsOrders' = 'false', 'owner: ve que su restaurante no acepta pedidos');
+reset role;
+
+-- 18.6 Los límites contra pedidos masivos siguen funcionando igual con la protección comercial
+-- (L1, sección 16, es «activa»: allí ya se comprobaron todos los límites). Además, si el restaurante
+-- no está autorizado, ningún intento crea pedidos, ni siquiera por debajo de los límites.
+select tests.claims(null, null);
+select tests.ok((select count(*) from private.order_limit_hits where restaurant_id = tests.l1()) > 0
+  and (tests.acc(tests.l1())).status = 'activa', 'límites: siguen frenando pedidos en un restaurante activo (sección 16)');
+set role anon;
+select tests.claims('anon', null);
+select tests.ok((select bool_and(tests.order_try(tests.k1(), tests.k1_prod(), 80100 + i) = 'El restaurante no acepta pedidos en este momento') from generate_series(1, 12) i),
+  'vencido: 12 intentos seguidos, ninguno se guarda');
+reset role;
+select tests.ok(tests.k1_orders() = 6 and not exists (select 1 from private.order_limit_hits where restaurant_id = tests.k1()),
+  'vencido: los intentos rechazados no crean pedidos ni cuentan como intentos frenados por límites');
 
 -- ===================== Resultado =====================
 \o

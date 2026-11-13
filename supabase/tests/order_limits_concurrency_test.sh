@@ -29,11 +29,13 @@ barrera() { $P -c "select (clock_timestamp() + interval '1.5 seconds')::text"; }
 abiertos() { $P -c "select count(*) from public.orders where restaurant_id = '$R' and payment_status = 'pendiente_caja' and prep_status in ('nuevo','en_preparacion','listo') ${1:-}"; }
 
 # Restaurante propio con límites bajos: 3 por mesa, 2 para recoger, 5 en el restaurante, 2 online.
+# Como todo restaurante nuevo empieza en «borrador» (sin pedidos), se le asigna expresamente «activa».
 $P -c "insert into public.restaurants (id, slug, name, active, tables, pickup_enabled, online_payment_enabled, counter_payment_enabled)
        values ('$R', 'limites-paralelo', 'Límites en paralelo', true, 20, true, true, true)" \
    -c "insert into public.categories (id, restaurant_id, name) values ('f1000000-0000-4000-8000-000000000101', '$R', 'Carta')" \
    -c "insert into public.products (id, restaurant_id, category_id, name, price_cents) values ('$PROD', '$R', 'f1000000-0000-4000-8000-000000000101', 'Menú', 500)" \
    -c "insert into private.order_limits (restaurant_id, per_table, pickup, per_restaurant, online_pending, window_minutes) values ('$R', 3, 2, 5, 2, 30)" \
+   -c "update private.tenant_accounts set status = 'activa' where restaurant_id = '$R' and status = 'borrador'" \
    -c "insert into auth.users (id, email) values ('$SALA', 'sala@paralelo.test')" \
    -c "insert into public.restaurant_staff (restaurant_id, user_id, role) values ('$R', '$SALA', 'waiter')" > /dev/null
 

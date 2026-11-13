@@ -2,8 +2,9 @@
 # Prueba la cadena de migraciones en un PostgreSQL LOCAL y desechable. Nunca contra Supabase.
 #   a5d5a87 (fase 2) + datos → fase 3 → fase 4 → fase 5 → fase 6  ==  instalación nueva de schema.sql
 #   las subidas se pueden repetir y no alteran datos
-#   … → fase 6 (ad26da1) → límites de pedidos (fase 7, 886a37c) → base comercial (fase 8)  ==  instalación nueva
-#   cada bajada restaura la fase anterior: 8 → 7 (886a37c) → 7 → 6 (ad26da1) → 5 (55c6837) → 4 (b48fb53) → 3 (07348e4) → 2 (a5d5a87)
+#   … → fase 6 (ad26da1) → límites de pedidos (fase 7, 886a37c) → base comercial (fase 8, 048a661)
+#   → protección comercial de los pedidos (fase 9)  ==  instalación nueva
+#   cada bajada restaura la fase anterior: 9 → 8 (048a661) → 7 (886a37c) → 7 → 6 (ad26da1) → 5 (55c6837) → 4 (b48fb53) → 3 (07348e4) → 2 (a5d5a87)
 set -euo pipefail
 export PGOPTIONS="-c client_min_messages=warning"
 cd "$(dirname "$0")/.."
@@ -20,6 +21,8 @@ UP7=migrations/20261108120000_limites_pedidos.sql
 DOWN7=migrations_down/20261108120000_limites_pedidos.down.sql
 UP8=migrations/20261112120000_base_comercial.sql
 DOWN8=migrations_down/20261112120000_base_comercial.down.sql
+UP9=migrations/20261113120000_proteccion_comercial_pedidos.sql
+DOWN9=migrations_down/20261113120000_proteccion_comercial_pedidos.down.sql
 TMP=$(mktemp -d)
 git show a5d5a87:supabase/schema.sql > "$TMP/schema_f2.sql"
 git show 07348e4:supabase/schema.sql > "$TMP/schema_f3.sql"
@@ -27,6 +30,7 @@ git show b48fb53:supabase/schema.sql > "$TMP/schema_f4.sql"
 git show 55c6837:supabase/schema.sql > "$TMP/schema_f5.sql"
 git show ad26da1:supabase/schema.sql > "$TMP/schema_f6.sql"
 git show 886a37c:supabase/schema.sql > "$TMP/schema_f7.sql"
+git show 048a661:supabase/schema.sql > "$TMP/schema_f8.sql"
 P() { psql -v ON_ERROR_STOP=1 -q -d "$1" "${@:2}"; }
 nuevo_db() { psql -q -d postgres -c "drop database if exists $1" -c "create database $1"; P "$1" -f tests/supabase_shim.sql 2>/dev/null; }
 volcado() { pg_dump --schema-only -d "$1" | grep -vE '^(--|SET |SELECT pg_catalog|\\(un)?restrict )' | sed '/^$/d' > "$2"; }
@@ -52,7 +56,8 @@ nuevo_db mig_ref4; P mig_ref4 -f "$TMP/schema_f4.sql"; volcado mig_ref4 "$TMP/f4
 nuevo_db mig_ref5; P mig_ref5 -f "$TMP/schema_f5.sql"; volcado mig_ref5 "$TMP/f5.sql"
 nuevo_db mig_ref6; P mig_ref6 -f "$TMP/schema_f6.sql"; volcado mig_ref6 "$TMP/f6.sql"
 nuevo_db mig_ref7; P mig_ref7 -f "$TMP/schema_f7.sql"; volcado mig_ref7 "$TMP/f7.sql"
-nuevo_db mig_ref8; P mig_ref8 -f schema.sql; volcado mig_ref8 "$TMP/f8.sql"
+nuevo_db mig_ref8; P mig_ref8 -f "$TMP/schema_f8.sql"; volcado mig_ref8 "$TMP/f8.sql"
+nuevo_db mig_ref9; P mig_ref9 -f schema.sql; volcado mig_ref9 "$TMP/f9.sql"
 # La base comercial NO cambia nada de los pedidos: mismas funciones y mismos triggers que en la fase 7.
 fpedidos() { P "$1" -tAc "select md5(string_agg(pg_get_functiondef(p.oid), '' order by p.proname, p.oid::regprocedure::text))
   from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname in ('public', 'private') and p.proname in (
@@ -64,6 +69,12 @@ tpedidos() { P "$1" -tAc "select string_agg(tgrelid::regclass || '.' || tgname |
 [ "$(fpedidos mig_ref7)" = "$(fpedidos mig_ref8)" ] && [ "$(tpedidos mig_ref7)" = "$(tpedidos mig_ref8)" ] \
   || fallo "la base comercial ha cambiado funciones o triggers de los pedidos"
 echo "OK  la base comercial no cambia ninguna función ni trigger de los pedidos (15 funciones, $(tpedidos mig_ref8 | tr ',' '\n' | wc -l) triggers)"
+# La protección comercial tampoco cambia ninguna función de los pedidos: solo AÑADE su trigger.
+[ "$(fpedidos mig_ref8)" = "$(fpedidos mig_ref9)" ] || fallo "la protección comercial ha cambiado funciones de los pedidos"
+[ "$(tpedidos mig_ref9 | tr ',' '\n' | grep -v '^orders\.orders_commercial_guard:private\.guard_order_commercial$' | paste -sd,)" = "$(tpedidos mig_ref8)" ] \
+  && tpedidos mig_ref9 | tr ',' '\n' | grep -qx 'orders.orders_commercial_guard:private.guard_order_commercial' \
+  || fallo "la protección comercial ha cambiado triggers de los pedidos (o falta el suyo)"
+echo "OK  la protección comercial no cambia ninguna función de los pedidos y solo añade el trigger orders_commercial_guard"
 
 nuevo_db mig_cadena; P mig_cadena -f "$TMP/schema_f2.sql"; con_datos mig_cadena; D0=$(datos mig_cadena)
 P mig_cadena -f "$UP3"; volcado mig_cadena "$TMP/c3.sql"; iguales "$TMP/f3.sql" "$TMP/c3.sql" "fase 2 + subida fase 3 = esquema de la fase 3"
@@ -105,7 +116,7 @@ P mig_cadena -f "$UP7"; volcado mig_cadena "$TMP/c7.sql"; iguales "$TMP/f7.sql" 
 echo "OK  la subida de los límites conserva cada pedido, su estado, su importe y sus fechas ($(estados))"
 [ "$(cuentas)" = "$U0" ] && [ "$(soporte)" = "$S0" ] || fallo "la subida de los límites ha cambiado cuentas, personal o soporte"
 # Base comercial: cada restaurante que ya existe queda «sin_asignar»; uno nuevo nace «borrador».
-P mig_cadena -f "$UP8"; volcado mig_cadena "$TMP/c8.sql"; iguales "$TMP/f8.sql" "$TMP/c8.sql" "fase 7 + subida de la base comercial = instalación nueva"
+P mig_cadena -f "$UP8"; volcado mig_cadena "$TMP/c8.sql"; iguales "$TMP/f8.sql" "$TMP/c8.sql" "fase 7 + subida de la base comercial = esquema de la fase 8"
 [ "$(pedidos)" = "$O0" ] && [ "$(datos mig_cadena)" = "$D0" ] && [ "$(cuentas)" = "$U0" ] && [ "$(soporte)" = "$S0" ] \
   || fallo "la subida de la base comercial ha cambiado pedidos, datos, cuentas o soporte"
 comerciales() { P mig_cadena -tAc "select count(*) || ':' || count(*) filter (where status = 'sin_asignar' and origin = 'existente' and plan_code is null and trial_started_at is null) from private.tenant_accounts"; }
@@ -116,8 +127,22 @@ NUEVO=$(P mig_cadena -c "begin" -c "insert into public.restaurants (slug, name) 
   -c "select a.status || '/' || a.origin from private.tenant_accounts a join public.restaurants r on r.id = a.restaurant_id where r.slug = 'nuevo-tras-migracion'" -c "rollback" | grep '/' | tr -d ' ')
 [ "$NUEVO" = "borrador/alta" ] || fallo "un restaurante creado tras la migración no empieza en borrador ($NUEVO)"
 echo "OK  un restaurante creado después de la migración empieza en «borrador» (nunca «sin_asignar»)"
-P mig_cadena -f "$UP3"; P mig_cadena -f "$UP4"; P mig_cadena -f "$UP5"; P mig_cadena -f "$UP6"; P mig_cadena -f "$UP7"; P mig_cadena -f "$UP8"; volcado mig_cadena "$TMP/c6b.sql"
-diff -q "$TMP/c8.sql" "$TMP/c6b.sql" > /dev/null || fallo "repetir las subidas cambia la estructura"
+# Protección comercial: los restaurantes que ya existían («sin_asignar») siguen aceptando pedidos.
+P mig_cadena -f "$UP9"; volcado mig_cadena "$TMP/c9.sql"; iguales "$TMP/f9.sql" "$TMP/c9.sql" "fase 8 + subida de la protección comercial = instalación nueva"
+[ "$(pedidos)" = "$O0" ] && [ "$(datos mig_cadena)" = "$D0" ] && [ "$(cuentas)" = "$U0" ] && [ "$(comerciales)" = "$NR:$NR" ] \
+  || fallo "la subida de la protección comercial ha cambiado pedidos, datos, cuentas o cuentas comerciales"
+PEDIDO=$(P mig_cadena -tA -c "begin" -c "select set_config('request.jwt.claims', '{\"role\":\"anon\"}', true)" -c "set local role anon" \
+  -c "select (public.create_order('{\"restaurantId\":\"5e5e0000-0000-4000-8000-000000000001\",\"mode\":\"mesa\",\"table\":6,\"paymentMethod\":\"caja\",\"accessToken\":\"$(printf '%064d' 99)\",\"items\":[{\"productId\":\"5e5e0000-0000-4000-8000-000000000201\",\"quantity\":1}]}') ->> 'id') is not null" \
+  -c "rollback" | grep -xE 't|f')
+[ "$PEDIDO" = t ] || fallo "tras la protección comercial, un restaurante que ya existía (sin_asignar) no acepta pedidos"
+BLOQ=$(P mig_cadena -tA -c "begin" -c "insert into public.restaurants (id, slug, name) values ('f9000000-0000-4000-8000-000000000001', 'nuevo-proteccion', 'Nuevo')" \
+  -c "select private.tenant_order_authorized('f9000000-0000-4000-8000-000000000001')::text || '/' || private.tenant_order_authorized('5e5e0000-0000-4000-8000-000000000001')::text" \
+  -c "rollback" | grep '/')
+[ "$BLOQ" = "false/true" ] || fallo "protección comercial: un restaurante nuevo (borrador) debería estar bloqueado y uno existente no ($BLOQ)"
+[ "$(pedidos)" = "$O0" ] || fallo "las comprobaciones de la protección comercial han dejado pedidos"
+echo "OK  tras la protección comercial, los restaurantes que ya existían siguen aceptando pedidos y uno nuevo (borrador) no"
+P mig_cadena -f "$UP3"; P mig_cadena -f "$UP4"; P mig_cadena -f "$UP5"; P mig_cadena -f "$UP6"; P mig_cadena -f "$UP7"; P mig_cadena -f "$UP8"; P mig_cadena -f "$UP9"; volcado mig_cadena "$TMP/c6b.sql"
+diff -q "$TMP/c9.sql" "$TMP/c6b.sql" > /dev/null || fallo "repetir las subidas cambia la estructura"
 [ "$(comerciales)" = "$NR:$NR" ] || fallo "repetir las subidas ha cambiado las cuentas comerciales"
 [ "$(pedidos)" = "$O0" ] || fallo "repetir las subidas ha cambiado pedidos"
 [ "$(datos mig_cadena)" = "$D0" ] || fallo "repetir las subidas ha cambiado datos"
@@ -139,6 +164,10 @@ D1=$(datos mig_cadena); U1=$(cuentas)
 P mig_cadena -c "insert into private.order_limits (restaurant_id, per_table) values ('5e5e0000-0000-4000-8000-000000000001', 3)" \
   -c "insert into private.order_limit_hits (restaurant_id, window_start, limit_kind, table_number) values ('5e5e0000-0000-4000-8000-000000000001', now(), 'mesa', 4)" > /dev/null
 O1=$(pedidos)
+P mig_cadena -f "$DOWN9"; volcado mig_cadena "$TMP/b8.sql"; iguales "$TMP/f8.sql" "$TMP/b8.sql" "bajada de la protección comercial = esquema de la fase 8"
+[ "$(pedidos)" = "$O1" ] && [ "$(datos mig_cadena)" = "$D1" ] && [ "$(cuentas)" = "$U1" ] && [ "$(comerciales)" = "$NR:$NR" ] \
+  || fallo "la bajada de la protección comercial ha cambiado pedidos, datos, cuentas o cuentas comerciales"
+echo "OK  la bajada de la protección comercial conserva pedidos, datos, cuentas y cuentas comerciales"
 P mig_cadena -f "$DOWN8"; volcado mig_cadena "$TMP/b7.sql"; iguales "$TMP/f7.sql" "$TMP/b7.sql" "bajada de la base comercial = esquema de la fase 7"
 [ "$(pedidos)" = "$O1" ] && [ "$(datos mig_cadena)" = "$D1" ] && [ "$(cuentas)" = "$U1" ] || fallo "la bajada de la base comercial ha cambiado pedidos, datos o cuentas"
 P mig_cadena -tAc "select count(*) from private.audit_log where action = 'comercial.alta'" | grep -qx "$NR" || fallo "la bajada de la base comercial ha perdido entradas de auditoría"
@@ -159,6 +188,6 @@ P mig_cadena -f "$DOWN4"; volcado mig_cadena "$TMP/b3.sql"; iguales "$TMP/f3.sql
 P mig_cadena -f "$DOWN3"; volcado mig_cadena "$TMP/b2.sql"; iguales "$TMP/f2.sql" "$TMP/b2.sql" "bajada fase 3 = esquema de la fase 2"
 [ "$(datos mig_cadena)" = "$D1" ] || fallo "las bajadas han cambiado datos"
 echo "OK  las bajadas conservan pedidos, carta, restaurantes y personal"
-psql -q -d postgres -c "drop database mig_ref2" -c "drop database mig_ref3" -c "drop database mig_ref4" -c "drop database mig_ref5" -c "drop database mig_ref6" -c "drop database mig_ref7" -c "drop database mig_ref8" -c "drop database mig_cadena"
+psql -q -d postgres -c "drop database mig_ref2" -c "drop database mig_ref3" -c "drop database mig_ref4" -c "drop database mig_ref5" -c "drop database mig_ref6" -c "drop database mig_ref7" -c "drop database mig_ref8" -c "drop database mig_ref9" -c "drop database mig_cadena"
 rm -rf "$TMP"
 echo "Migraciones: todas las comprobaciones superadas"

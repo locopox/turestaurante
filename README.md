@@ -209,7 +209,8 @@ npm run test:e2e:local  # recorridos de invitaciones en el navegador contra Supa
 `npm run test:db` crea una base de datos desechable `turestaurante_test` en el PostgreSQL al que apunten
 `PGHOST`/`PGPORT`/`PGUSER`, carga `supabase/tests/supabase_shim.sql` (imita los roles de Supabase),
 `schema.sql` y `seed.sql`, dos veces cada uno, y ejecuta `supabase/tests/security_test.sql`. Después prueba con
-sesiones en paralelo las entregas de invitaciones y los límites de pedidos (`order_limits_concurrency_test.sh`).
+sesiones en paralelo las entregas de invitaciones, los límites de pedidos (`order_limits_concurrency_test.sh`) y la
+protección comercial de los pedidos (`commercial_concurrency_test.sh`).
 
 ## Migraciones
 
@@ -240,15 +241,26 @@ sesiones en paralelo las entregas de invitaciones y los límites de pedidos (`or
   ahora y dura 14 días; sus fechas no se pueden elegir ni adelantar; no hay segunda prueba). Owner y manager la
   consultan con `restaurant_commercial_status`; la plataforma, con `platform_list_commercial_accounts`. **En esta
   etapa no bloquea nada**: los pedidos funcionan igual. No borra ni modifica datos.
-- `supabase/migrations_down/` las deshace (primero la de la base comercial, que **borra las cuentas comerciales**;
+- `supabase/migrations/20261113120000_proteccion_comercial_pedidos.sql` (después de la base comercial) añade la
+  **protección comercial de los pedidos**: un trigger ANTES de insertar cada pedido (`orders_commercial_guard`) solo
+  deja crear pedidos NUEVOS si el restaurante está «sin_asignar» (los que ya existían), «activa» o en «prueba» antes de
+  su fin (hora real del servidor, también tras esperar un bloqueo). «borrador», «vencida» o sin cuenta comercial: «El
+  restaurante no acepta pedidos en este momento». No cambia `create_order` ni ninguna función de pedidos: los
+  reintentos de pedidos ya creados y la gestión de los pedidos anteriores (cocina, cobro, cancelación, pasar a caja)
+  siguen igual. La plataforma asigna modalidades o amplía una prueba con `platform_set_commercial_status` (con motivo
+  y auditado). **Cambio de comportamiento:** los restaurantes en «borrador» dejan de recibir pedidos hasta que la
+  plataforma les asigne una modalidad; antes de aplicarla, revisa cuáles hay. `seed.sql` deja «activa» La Piazza de
+  ejemplo SOLO cuando la crea en una instalación nueva.
+- `supabase/migrations_down/` las deshace (primero la de la protección comercial, que no borra datos; después la de
+  la base comercial, que **borra las cuentas comerciales**;
   después la de los límites de pedidos, que **borra los límites fijados y el
   registro de intentos frenados**; después la de la recuperación programada; después la de la fase 6, que **borra el historial de invitaciones**,
   también las pendientes, y conserva a quien ya aceptó; después la de la fase 5, que **borra el registro de consultas
   denegadas**). La de la fase 4 **borra el historial de
   accesos de soporte** (el registro de auditoría se conserva); la de la fase 3 **borra el registro de auditoría y
   las suspensiones**.
-- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 → fase 6 → límites de pedidos → base comercial es
-  idéntica a una instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
+- `npm run test:migration` comprueba en local la cadena completa: fase 2 → fase 3 → fase 4 → fase 5 → fase 6 → límites de pedidos → base comercial →
+  protección comercial es idéntica a una instalación nueva, las subidas se pueden repetir, cada bajada restaura la versión anterior y los datos no cambian.
 
 Tras la fase 3, una cuenta de plataforma **no** puede operar restaurantes. Para usar el panel o la cocina de La Piazza
 hace falta una cuenta de personal distinta (por ejemplo, un propietario). Desde la fase 6 se invita
